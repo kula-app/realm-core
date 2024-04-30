@@ -70,7 +70,7 @@ int64_t next_null_candidate(int64_t previous_candidate)
     x += 0xfffffffbULL;
     return int64_t(x);
 }
-}
+} // namespace
 
 int_fast64_t ArrayIntNull::choose_random_null(int64_t incoming) const
 {
@@ -169,7 +169,7 @@ void ArrayIntNull::find_all(IntegerColumn* result, value_type value, size_t col_
 
 bool ArrayIntNull::find(int cond, value_type value, size_t start, size_t end, QueryStateBase* state) const
 {
-    return find_impl(cond, value, start, end, state, nullptr);
+    return find_impl(cond, value, start, end, state);
 }
 
 size_t ArrayIntNull::find_first(value_type value, size_t begin, size_t end) const

@@ -1,29 +1,34 @@
 #ifndef REALM_OBJECT_STORE_C_API_TYPES_HPP
 #define REALM_OBJECT_STORE_C_API_TYPES_HPP
 
-#include <memory>
 #include <realm.h>
-#include <realm/object-store/c_api/conversion.hpp>
-#include <realm/object-store/c_api/error.hpp>
 
 #include <realm/util/to_string.hpp>
 
-#include <realm/object-store/shared_realm.hpp>
-#include <realm/object-store/object_schema.hpp>
+#include <realm/object-store/c_api/conversion.hpp>
+#include <realm/object-store/c_api/error.hpp>
 #include <realm/object-store/object.hpp>
 #include <realm/object-store/object_accessor.hpp>
-#include <realm/object-store/util/scheduler.hpp>
+#include <realm/object-store/object_schema.hpp>
+#include <realm/object-store/shared_realm.hpp>
 #include <realm/object-store/thread_safe_reference.hpp>
+#include <realm/object-store/util/scheduler.hpp>
 
 #if REALM_ENABLE_SYNC
-#include <realm/object-store/sync/app.hpp>
-#include <realm/object-store/sync/impl/sync_client.hpp>
-#include <realm/object-store/sync/sync_user.hpp>
-#include <realm/object-store/sync/mongo_collection.hpp>
-#include <realm/sync/binding_callback_thread_observer.hpp>
-#include <realm/sync/subscriptions.hpp>
-#endif
 
+#if REALM_APP_SERVICES
+#include <realm/object-store/sync/app.hpp>
+#include <realm/object-store/sync/app_user.hpp>
+#include <realm/object-store/sync/mongo_collection.hpp>
+#endif // REALM_APP_SERVICES
+
+#include <realm/object-store/sync/impl/sync_client.hpp>
+#include <realm/sync/binding_callback_thread_observer.hpp>
+#include <realm/sync/socket_provider.hpp>
+#include <realm/sync/subscriptions.hpp>
+#endif // REALM_ENABLE_SYNC
+
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -40,17 +45,17 @@ class CallbackFailed : public RuntimeError {
 public:
     // SDK-provided opaque error value when error == RLM_ERR_CALLBACK with a callout to
     // realm_register_user_code_callback_error()
-    void* usercode_error{nullptr};
+    void* user_code_error{nullptr};
 
     CallbackFailed()
         : RuntimeError(ErrorCodes::CallbackFailed, "User-provided callback failed")
     {
     }
 
-    CallbackFailed(void* str)
+    explicit CallbackFailed(void* error)
         : CallbackFailed()
     {
-        usercode_error = str;
+        user_code_error = error;
     }
 };
 
@@ -410,6 +415,13 @@ struct realm_dictionary : realm::c_api::WrapC, realm::object_store::Dictionary {
     }
 };
 
+struct realm_key_path_array : realm::c_api::WrapC, realm::KeyPathArray {
+    explicit realm_key_path_array(realm::KeyPathArray kpa)
+        : realm::KeyPathArray(std::move(kpa))
+    {
+    }
+};
+
 struct realm_object_changes : realm::c_api::WrapC, realm::CollectionChangeSet {
     explicit realm_object_changes(realm::CollectionChangeSet changes)
         : realm::CollectionChangeSet(std::move(changes))
@@ -561,6 +573,7 @@ struct realm_results : realm::c_api::WrapC, realm::Results {
 };
 
 #if REALM_ENABLE_SYNC
+
 struct realm_async_open_task_progress_notification_token : realm::c_api::WrapC {
     realm_async_open_task_progress_notification_token(std::shared_ptr<realm::AsyncOpenTask> task, uint64_t token)
         : task(task)
@@ -604,10 +617,6 @@ struct realm_http_transport : realm::c_api::WrapC, std::shared_ptr<realm::app::G
     }
 };
 
-struct realm_app_config : realm::c_api::WrapC, realm::app::App::Config {
-    using Config::Config;
-};
-
 struct realm_sync_client_config : realm::c_api::WrapC, realm::SyncClientConfig {
     using SyncClientConfig::SyncClientConfig;
 };
@@ -618,6 +627,12 @@ struct realm_sync_config : realm::c_api::WrapC, realm::SyncConfig {
         : SyncConfig(c)
     {
     }
+};
+
+#if REALM_APP_SERVICES
+
+struct realm_app_config : realm::c_api::WrapC, realm::app::AppConfig {
+    using AppConfig::AppConfig;
 };
 
 struct realm_app : realm::c_api::WrapC, realm::app::SharedApp {
@@ -640,12 +655,33 @@ struct realm_app : realm::c_api::WrapC, realm::app::SharedApp {
     }
 };
 
+struct realm_app_user_subscription_token : realm::c_api::WrapC {
+    using Token = realm::Subscribable<realm::app::User>::Token;
+    realm_app_user_subscription_token(std::shared_ptr<realm::app::User> user, Token&& token)
+        : user(user)
+        , token(std::move(token))
+    {
+    }
+    ~realm_app_user_subscription_token();
+    std::shared_ptr<realm::app::User> user;
+    Token token;
+};
+
 struct realm_app_credentials : realm::c_api::WrapC, realm::app::AppCredentials {
     realm_app_credentials(realm::app::AppCredentials credentials)
         : realm::app::AppCredentials{std::move(credentials)}
     {
     }
 };
+
+struct realm_mongodb_collection : realm::c_api::WrapC, realm::app::MongoCollection {
+    realm_mongodb_collection(realm::app::MongoCollection collection)
+        : realm::app::MongoCollection(std::move(collection))
+    {
+    }
+};
+
+#endif // REALM_APP_SERVICES
 
 struct realm_user : realm::c_api::WrapC, std::shared_ptr<realm::SyncUser> {
     realm_user(std::shared_ptr<realm::SyncUser> user)
@@ -681,6 +717,26 @@ struct realm_sync_session : realm::c_api::WrapC, std::shared_ptr<realm::SyncSess
     bool equals(const WrapC& other) const noexcept final
     {
         if (auto ptr = dynamic_cast<const realm_sync_session*>(&other)) {
+            return get() == ptr->get();
+        }
+        return false;
+    }
+};
+
+struct realm_sync_manager : realm::c_api::WrapC, std::shared_ptr<realm::SyncManager> {
+    realm_sync_manager(std::shared_ptr<realm::SyncManager> manager)
+        : std::shared_ptr<realm::SyncManager>{std::move(manager)}
+    {
+    }
+
+    realm_sync_manager* clone() const override
+    {
+        return new realm_sync_manager{*this};
+    }
+
+    bool equals(const WrapC& other) const noexcept final
+    {
+        if (auto ptr = dynamic_cast<const realm_sync_manager*>(&other)) {
             return get() == ptr->get();
         }
         return false;
@@ -746,13 +802,6 @@ struct realm_async_open_task : realm::c_api::WrapC, std::shared_ptr<realm::Async
     }
 };
 
-struct realm_mongodb_collection : realm::c_api::WrapC, realm::app::MongoCollection {
-    realm_mongodb_collection(realm::app::MongoCollection collection)
-        : realm::app::MongoCollection(std::move(collection))
-    {
-    }
-};
-
 struct realm_sync_socket : realm::c_api::WrapC, std::shared_ptr<realm::sync::SyncSocketProvider> {
     explicit realm_sync_socket(std::shared_ptr<realm::sync::SyncSocketProvider> ptr)
         : std::shared_ptr<realm::sync::SyncSocketProvider>(std::move(ptr))
@@ -800,17 +849,24 @@ struct realm_sync_socket_callback : realm::c_api::WrapC,
     {
     }
 
-    realm_sync_socket_callback* clone() const override
-    {
-        return new realm_sync_socket_callback{*this};
-    }
-
     bool equals(const WrapC& other) const noexcept final
     {
         if (auto ptr = dynamic_cast<const realm_sync_socket_callback*>(&other)) {
             return get() == ptr->get();
         }
         return false;
+    }
+
+    void operator()(realm_sync_socket_callback_result_e result, const char* reason)
+    {
+        if (!get()) {
+            return;
+        }
+
+        auto complete_status = result == RLM_ERR_SYNC_SOCKET_SUCCESS
+                                   ? realm::Status::OK()
+                                   : realm::Status{static_cast<realm::ErrorCodes::Error>(result), reason};
+        (*get())(complete_status);
     }
 };
 

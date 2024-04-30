@@ -1,5 +1,6 @@
 #include <realm/object-store/c_api/types.hpp>
 #include <realm/object-store/c_api/util.hpp>
+#include <realm/object-store/keypath_helpers.hpp>
 
 namespace realm::c_api {
 namespace {
@@ -65,23 +66,27 @@ struct DictionaryNotificationsCallback {
 
 std::optional<KeyPathArray> build_key_path_array(realm_key_path_array_t* key_path_array)
 {
-    if (key_path_array) {
-        KeyPathArray ret;
-        for (size_t i = 0; i < key_path_array->nb_elements; i++) {
-            realm_key_path_t* key_path = key_path_array->paths + i;
-            ret.emplace_back();
-            KeyPath& kp = ret.back();
-            for (size_t j = 0; j < key_path->nb_elements; j++) {
-                realm_key_path_elem_t* path_elem = key_path->path_elements + j;
-                kp.emplace_back(TableKey(path_elem->object), ColKey(path_elem->property));
-            }
-        }
-        return ret;
+    std::optional<KeyPathArray> ret;
+    if (key_path_array && key_path_array->size()) {
+        ret.emplace(std::move(*key_path_array));
     }
-    return std::nullopt;
+    return ret;
 }
 
 } // namespace
+
+RLM_API realm_key_path_array_t* realm_create_key_path_array(const realm_t* realm,
+                                                            const realm_class_key_t object_class_key,
+                                                            size_t num_key_paths, const char** user_key_paths)
+{
+    return wrap_err([&]() {
+        KeyPathArray ret;
+        if (user_key_paths) {
+            ret = (*realm)->create_key_path_array(TableKey(object_class_key), num_key_paths, user_key_paths);
+        }
+        return new realm_key_path_array_t(std::move(ret));
+    });
+}
 
 RLM_API realm_notification_token_t* realm_object_add_notification_callback(realm_object_t* obj,
                                                                            realm_userdata_t userdata,
@@ -202,10 +207,9 @@ RLM_API void realm_collection_changes_get_num_ranges(const realm_collection_chan
 RLM_API void realm_collection_changes_get_num_changes(const realm_collection_changes_t* changes,
                                                       size_t* out_num_deletions, size_t* out_num_insertions,
                                                       size_t* out_num_modifications, size_t* out_num_moves,
-                                                      bool* out_collection_was_cleared)
+                                                      bool* out_collection_was_cleared,
+                                                      bool* out_collection_was_deleted)
 {
-    // FIXME: This has O(n) performance, which seems ridiculous.
-
     if (out_num_deletions)
         *out_num_deletions = changes->deletions.count();
     if (out_num_insertions)
@@ -216,6 +220,8 @@ RLM_API void realm_collection_changes_get_num_changes(const realm_collection_cha
         *out_num_moves = changes->moves.size();
     if (out_collection_was_cleared)
         *out_collection_was_cleared = changes->collection_was_cleared;
+    if (out_collection_was_deleted)
+        *out_collection_was_deleted = changes->collection_root_was_deleted;
 }
 
 static inline void copy_index_ranges(const IndexSet& index_set, realm_index_range_t* out_ranges, size_t max)
@@ -259,7 +265,8 @@ RLM_API void realm_collection_changes_get_ranges(
 }
 
 RLM_API void realm_dictionary_get_changes(const realm_dictionary_changes_t* changes, size_t* out_deletions_size,
-                                          size_t* out_insertion_size, size_t* out_modification_size)
+                                          size_t* out_insertion_size, size_t* out_modification_size,
+                                          bool* out_was_deleted)
 {
     if (out_deletions_size)
         *out_deletions_size = changes->deletions.size();
@@ -267,12 +274,15 @@ RLM_API void realm_dictionary_get_changes(const realm_dictionary_changes_t* chan
         *out_insertion_size = changes->insertions.size();
     if (out_modification_size)
         *out_modification_size = changes->modifications.size();
+    if (out_was_deleted)
+        *out_was_deleted = changes->collection_root_was_deleted;
 }
 
 RLM_API void realm_dictionary_get_changed_keys(const realm_dictionary_changes_t* changes,
                                                realm_value_t* deletion_keys, size_t* deletions_size,
                                                realm_value_t* insertion_keys, size_t* insertions_size,
-                                               realm_value_t* modification_keys, size_t* modifications_size)
+                                               realm_value_t* modification_keys, size_t* modifications_size,
+                                               bool* collection_was_cleared)
 {
     auto fill = [](const auto& collection, realm_value_t* out, size_t* n) {
         if (!out || !n)
@@ -290,6 +300,8 @@ RLM_API void realm_dictionary_get_changed_keys(const realm_dictionary_changes_t*
     fill(changes->deletions, deletion_keys, deletions_size);
     fill(changes->insertions, insertion_keys, insertions_size);
     fill(changes->modifications, modification_keys, modifications_size);
+    if (collection_was_cleared)
+        *collection_was_cleared = changes->collection_was_cleared;
 }
 
 static inline void copy_indices(const IndexSet& index_set, size_t* out_indices, size_t max)

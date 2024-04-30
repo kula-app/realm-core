@@ -18,6 +18,7 @@
 
 #include <iostream>
 #include <iomanip>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <set>
@@ -43,7 +44,17 @@ using namespace realm;
 using namespace realm::util;
 using namespace realm::test_util;
 
-static std::set<std::string> g_bench_filter;
+static std::vector<std::regex> g_bench_filter;
+
+static bool should_filter_benchmark(const std::string& name)
+{
+    if (g_bench_filter.empty())
+        return false;
+
+    return std::all_of(g_bench_filter.begin(), g_bench_filter.end(), [&](const std::regex& regex) {
+        return !std::regex_match(name, regex);
+    });
+}
 
 namespace {
 // not smaller than 100.000 or the UID based benchmarks has to be modified!
@@ -74,16 +85,10 @@ const char* to_lead_cstr(DBOptions::Durability level);
 const char* to_ident_cstr(DBOptions::Durability level);
 
 struct Benchmark {
-    Benchmark()
-    {
-    }
-    virtual ~Benchmark()
-    {
-    }
+    Benchmark() {}
+    virtual ~Benchmark() {}
     virtual const char* name() const = 0;
-    virtual void before_all(DBRef)
-    {
-    }
+    virtual void before_all(DBRef) {}
     virtual void after_all(DBRef)
     {
         m_keys.clear();
@@ -508,7 +513,7 @@ template <class Type>
 struct BenchmarkWithType : Benchmark {
     std::string benchmark_name;
     using underlying_type = typename Type::underlying_type;
-    std::vector<Mixed> needles;
+    std::vector<OwnedMixed> needles;
     BenchmarkWithType()
         : Benchmark()
     {
@@ -520,11 +525,10 @@ struct BenchmarkWithType : Benchmark {
             util::format("%1<%2><%3><%4>", prefix, get_data_type_name(Type::data_type),
                          Type::is_nullable ? "Nullable" : "NonNullable", Type::is_indexed ? "Indexed" : "NonIndexed");
     }
-    void before_all(DBRef group)
+    void do_add_perf_data(WriteTransaction& tr, bool add_index)
     {
         TestValueGenerator gen;
-        WriteTransaction tr(group);
-        TableRef t = tr.add_table(name());
+        TableRef t = tr.get_or_add_table(name());
         m_col = t->add_column(Type::data_type, name(), Type::is_nullable);
         Random r;
         for (size_t i = 0; i < BASE_SIZE / 2; ++i) {
@@ -536,15 +540,20 @@ struct BenchmarkWithType : Benchmark {
             }
         }
         while (needles.size() < 50) {
-            Mixed needle;
+            OwnedMixed needle;
             while (needle.is_null()) {
                 needle = t->get_object(r.draw_int<size_t>(0, t->size())).get_any(m_col);
             }
-            needles.push_back(needle);
+            needles.push_back(std::move(needle));
         }
-        if constexpr (Type::is_indexed) {
+        if (add_index) {
             t->add_search_index(m_col);
         }
+    }
+    void before_all(DBRef group)
+    {
+        WriteTransaction tr(group);
+        do_add_perf_data(tr, Type::is_indexed);
         tr.commit();
     }
 
@@ -597,6 +606,244 @@ struct BenchmarkMixedCaseInsensitiveEqual : public BenchmarkWithType<Type> {
     }
 };
 
+template <typename Type>
+struct BenchmarkRangeForType : public BenchmarkWithType<Type> {
+    using Base = BenchmarkWithType<Type>;
+    using underlying_type = typename Type::underlying_type;
+    BenchmarkRangeForType<Type>()
+        : BenchmarkWithType<Type>()
+    {
+        BenchmarkWithType<Type>::set_name_with_prefix("QueryRange");
+    }
+
+    void before_all(DBRef group) override
+    {
+        BenchmarkWithType<Type>::before_all(group);
+        std::sort(this->needles.begin(), this->needles.end());
+    }
+
+    void operator()(DBRef) override
+    {
+        for (size_t i = 1; i < Base::needles.size(); i++) {
+            if constexpr (std::is_same_v<underlying_type, Mixed>) {
+                TableView results = Base::m_table->where()
+                                        .greater(Base::m_col, Base::needles[i - 1])
+                                        .less(Base::m_col, Base::needles[i])
+                                        .find_all();
+                static_cast<void>(results);
+            }
+            else {
+                TableView results = Base::m_table->where()
+                                        .greater(Base::m_col, Base::needles[i - 1].template get<underlying_type>())
+                                        .less(Base::m_col, Base::needles[i].template get<underlying_type>())
+                                        .find_all();
+                static_cast<void>(results);
+            }
+        }
+    }
+};
+
+template <typename Type>
+struct BenchmarkCreateIndexForType : public BenchmarkWithType<Type> {
+    using Base = BenchmarkWithType<Type>;
+    using underlying_type = typename Type::underlying_type;
+    BenchmarkCreateIndexForType<Type>()
+        : BenchmarkWithType<Type>()
+    {
+        BenchmarkWithType<Type>::set_name_with_prefix("CreateIndexFor");
+    }
+    void before_all(DBRef group) override
+    {
+        WriteTransaction tr(group);
+        constexpr bool add_index = false;
+        BenchmarkWithType<Type>::do_add_perf_data(tr, add_index);
+        tr.commit();
+    }
+    void operator()(DBRef) override
+    {
+        Benchmark::m_table->add_search_index(Benchmark::m_col);
+    }
+};
+
+template <typename Type>
+struct BenchmarkInsertToIndexForType : public BenchmarkWithType<Type> {
+    using Base = BenchmarkWithType<Type>;
+    using underlying_type = typename Type::underlying_type;
+    BenchmarkInsertToIndexForType<Type>()
+        : BenchmarkWithType<Type>()
+    {
+        BenchmarkWithType<Type>::set_name_with_prefix("InsertWithIndex");
+    }
+    void before_all(DBRef group) override
+    {
+        WriteTransaction tr(group);
+        TableRef t = tr.get_or_add_table(Base::name());
+        Base::m_col = t->add_column(Type::data_type, Base::name(), Type::is_nullable);
+        if (Type::is_indexed) {
+            t->add_search_index(Base::m_col);
+        }
+        tr.commit();
+        m_random_values.reserve(BASE_SIZE / 2);
+        for (size_t i = 0; i < BASE_SIZE / 2; ++i) {
+            int64_t randomness = m_random.draw_int<int64_t>();
+            m_random_values.push_back(m_test_value_generator.convert_for_test<underlying_type>(randomness));
+        }
+    }
+    void operator()(DBRef) override
+    {
+        for (auto it = m_random_values.begin(); it != m_random_values.end(); ++it) {
+            // a hand full of duplicates
+            Base::m_table->create_object().set_any(Base::m_col, *it);
+            Base::m_table->create_object().set_any(Base::m_col, *it);
+        }
+    }
+    std::vector<Mixed> m_random_values;
+    TestValueGenerator m_test_value_generator;
+    Random m_random;
+};
+
+template <typename Type>
+struct BenchmarkInsertPKToIndexForType : public BenchmarkWithType<Type> {
+    using Base = BenchmarkWithType<Type>;
+    using underlying_type = typename Type::underlying_type;
+    BenchmarkInsertPKToIndexForType<Type>()
+        : BenchmarkWithType<Type>()
+    {
+        BenchmarkWithType<Type>::set_name_with_prefix("InsertPK");
+    }
+    void before_all(DBRef group) override
+    {
+        WriteTransaction tr(group);
+        TableRef t = tr.get_or_add_table(Base::name());
+        Base::m_col = t->add_column(Type::data_type, Base::name(), Type::is_nullable);
+        t->set_primary_key_column(Base::m_col);
+        REALM_ASSERT(t->has_search_index(Base::m_col));
+        tr.commit();
+        while (m_unique_randoms.size() < BASE_SIZE) {
+            int64_t random_int = m_random.draw_int<int64_t>();
+            m_unique_randoms.insert(m_test_value_generator.convert_for_test<underlying_type>(random_int));
+        }
+    }
+    void operator()(DBRef) override
+    {
+        for (auto it = m_unique_randoms.begin(); it != m_unique_randoms.end(); ++it) {
+            Base::m_table->create_object_with_primary_key(*it);
+        }
+    }
+    TestValueGenerator m_test_value_generator;
+    Random m_random;
+    std::set<underlying_type> m_unique_randoms;
+};
+
+template <typename Type>
+struct BenchmarkEraseObjectForType : public BenchmarkWithType<Type> {
+    using Base = BenchmarkWithType<Type>;
+    using underlying_type = typename Type::underlying_type;
+    BenchmarkEraseObjectForType<Type>()
+        : BenchmarkWithType<Type>()
+    {
+        BenchmarkWithType<Type>::set_name_with_prefix("EraseObject");
+    }
+    void before_all(DBRef group) override
+    {
+        Base::before_all(group);
+    }
+    void operator()(DBRef) override
+    {
+        while (!Base::m_table->is_empty()) {
+            Base::m_table->begin()->remove();
+        }
+    }
+};
+
+template <typename Type, size_t NUM_CONDITIONS>
+struct BenchmarkParsedChainedOrEquality : public BenchmarkWithType<Type> {
+    using Base = BenchmarkWithType<Type>;
+    using underlying_type = typename Type::underlying_type;
+    BenchmarkParsedChainedOrEquality<Type, NUM_CONDITIONS>()
+        : BenchmarkWithType<Type>()
+    {
+        BenchmarkWithType<Type>::set_name_with_prefix(util::format("QueryChainedOrEquality_%1", NUM_CONDITIONS));
+    }
+    void before_all(DBRef db) override
+    {
+        Random r;
+        Base::before_all(db);
+        auto wt = db->start_write();
+        TableRef table = wt->get_table(Base::name());
+        REALM_ASSERT(Base::needles.size());
+        while (Base::needles.size() < NUM_CONDITIONS) {
+            OwnedMixed needle;
+            while (needle.is_null()) {
+                needle = table->get_object(r.draw_int<size_t>(0, table->size())).get_any(Base::m_col);
+            }
+            Base::needles.push_back(std::move(needle));
+        }
+
+        table->rename_column(Base::m_col, "col");
+        std::string col_name = table->get_column_name(Base::m_col);
+
+        for (size_t i = 0; i < Base::needles.size(); ++i) {
+            m_query_string += util::format("%1%2 == %3", i == 0 ? "" : " or ", col_name, Base::needles[i]);
+        }
+
+        wt->commit();
+    }
+
+    void operator()(DBRef) override
+    {
+        TableView tv = Base::m_table->query(m_query_string).find_all();
+        tv.clear();
+    }
+
+    std::string m_query_string;
+};
+
+template <typename Type, size_t NUM_CONDITIONS>
+struct BenchmarkParsedIn : public BenchmarkWithType<Type> {
+    using Base = BenchmarkWithType<Type>;
+    using underlying_type = typename Type::underlying_type;
+    BenchmarkParsedIn<Type, NUM_CONDITIONS>()
+        : BenchmarkWithType<Type>()
+    {
+        BenchmarkWithType<Type>::set_name_with_prefix(util::format("QueryParsedIN_%1", NUM_CONDITIONS));
+    }
+    void before_all(DBRef db) override
+    {
+        Random r;
+        Base::before_all(db);
+        auto wt = db->start_write();
+        TableRef table = wt->get_table(Base::name());
+        REALM_ASSERT(Base::needles.size());
+        while (Base::needles.size() < NUM_CONDITIONS) {
+            OwnedMixed needle;
+            while (needle.is_null()) {
+                needle = table->get_object(r.draw_int<size_t>(0, table->size())).get_any(Base::m_col);
+            }
+            Base::needles.push_back(std::move(needle));
+        }
+
+        table->rename_column(Base::m_col, "col");
+        std::string col_name = table->get_column_name(Base::m_col);
+
+        m_query_string = "col IN {";
+        for (size_t i = 0; i < Base::needles.size(); ++i) {
+            m_query_string += util::format("%1%2", i == 0 ? "" : ", ", Base::needles[i]);
+        }
+        m_query_string += "}";
+        wt->commit();
+    }
+
+    void operator()(DBRef) override
+    {
+        TableView tv = Base::m_table->query(m_query_string).find_all();
+        tv.clear();
+    }
+
+    std::string m_query_string;
+};
+
+
 struct BenchmarkWithTimestamps : Benchmark {
     std::multiset<Timestamp> values;
     Timestamp needle;
@@ -616,7 +863,8 @@ struct BenchmarkWithTimestamps : Benchmark {
             if (r.draw_int<int64_t>(0, 100) / 100.0 < percent_chance_of_null) {
                 time = Timestamp{};
                 ++num_nulls_added;
-            } else {
+            }
+            else {
                 values.insert(time);
             }
             auto obj = t->create_object();
@@ -642,7 +890,8 @@ struct BenchmarkWithTimestamps : Benchmark {
 };
 
 struct BenchmarkQueryTimestampGreater : BenchmarkWithTimestamps {
-    void before_all(DBRef group) {
+    void before_all(DBRef group)
+    {
         percent_chance_of_null = 0.10f;
         percent_results_to_needle = 0.80f;
         BenchmarkWithTimestamps::before_all(group);
@@ -657,7 +906,8 @@ struct BenchmarkQueryTimestampGreater : BenchmarkWithTimestamps {
         ConstTableRef table = m_table;
         Query query = table->where().greater(m_col, needle);
         TableView results = query.find_all();
-        REALM_ASSERT_EX(results.size() == values.size() - num_results_to_needle - 1, results.size(), num_results_to_needle, values.size());
+        REALM_ASSERT_EX(results.size() == values.size() - num_results_to_needle - 1, results.size(),
+                        num_results_to_needle, values.size());
         static_cast<void>(results);
     }
 };
@@ -706,7 +956,8 @@ struct BenchmarkQueryTimestampGreaterOverLinks : BenchmarkQueryTimestampGreater 
 
 
 struct BenchmarkQueryTimestampGreaterEqual : BenchmarkWithTimestamps {
-    void before_all(DBRef group) {
+    void before_all(DBRef group)
+    {
         percent_chance_of_null = 0.10f;
         percent_results_to_needle = 0.80f;
         BenchmarkWithTimestamps::before_all(group);
@@ -721,14 +972,16 @@ struct BenchmarkQueryTimestampGreaterEqual : BenchmarkWithTimestamps {
         ConstTableRef table = m_table;
         Query query = table->where().greater_equal(m_col, needle);
         TableView results = query.find_all();
-        REALM_ASSERT_EX(results.size() == values.size() - num_results_to_needle, results.size(), num_results_to_needle, values.size());
+        REALM_ASSERT_EX(results.size() == values.size() - num_results_to_needle, results.size(),
+                        num_results_to_needle, values.size());
         static_cast<void>(results);
     }
 };
 
 
 struct BenchmarkQueryTimestampLess : BenchmarkWithTimestamps {
-    void before_all(DBRef group) {
+    void before_all(DBRef group)
+    {
         percent_chance_of_null = 0.10f;
         percent_results_to_needle = 0.20f;
         BenchmarkWithTimestamps::before_all(group);
@@ -743,13 +996,15 @@ struct BenchmarkQueryTimestampLess : BenchmarkWithTimestamps {
         ConstTableRef table = m_table;
         Query query = table->where().less(m_col, needle);
         TableView results = query.find_all();
-        REALM_ASSERT_EX(results.size() == num_results_to_needle, results.size(), num_results_to_needle, values.size());
+        REALM_ASSERT_EX(results.size() == num_results_to_needle, results.size(), num_results_to_needle,
+                        values.size());
         static_cast<void>(results);
     }
 };
 
 struct BenchmarkQueryTimestampLessEqual : BenchmarkWithTimestamps {
-    void before_all(DBRef group) {
+    void before_all(DBRef group)
+    {
         percent_chance_of_null = 0.10f;
         percent_results_to_needle = 0.20f;
         BenchmarkWithTimestamps::before_all(group);
@@ -764,14 +1019,16 @@ struct BenchmarkQueryTimestampLessEqual : BenchmarkWithTimestamps {
         ConstTableRef table = m_table;
         Query query = table->where().less_equal(m_col, needle);
         TableView results = query.find_all();
-        REALM_ASSERT_EX(results.size() == num_results_to_needle + 1, results.size(), num_results_to_needle, values.size());
+        REALM_ASSERT_EX(results.size() == num_results_to_needle + 1, results.size(), num_results_to_needle,
+                        values.size());
         static_cast<void>(results);
     }
 };
 
 
 struct BenchmarkQueryTimestampEqual : BenchmarkWithTimestamps {
-    void before_all(DBRef group) {
+    void before_all(DBRef group)
+    {
         percent_chance_of_null = 0.10f;
         percent_results_to_needle = 0.33f;
         BenchmarkWithTimestamps::before_all(group);
@@ -786,13 +1043,15 @@ struct BenchmarkQueryTimestampEqual : BenchmarkWithTimestamps {
         ConstTableRef table = m_table;
         Query query = table->where().equal(m_col, needle);
         TableView results = query.find_all();
-        REALM_ASSERT_EX(results.size() == values.count(needle), results.size(), num_results_to_needle, values.count(needle), values.size());
+        REALM_ASSERT_EX(results.size() == values.count(needle), results.size(), num_results_to_needle,
+                        values.count(needle), values.size());
         static_cast<void>(results);
     }
 };
 
 struct BenchmarkQueryTimestampNotEqual : BenchmarkWithTimestamps {
-    void before_all(DBRef group) {
+    void before_all(DBRef group)
+    {
         percent_chance_of_null = 0.60f;
         percent_results_to_needle = 0.10f;
         BenchmarkWithTimestamps::before_all(group);
@@ -807,13 +1066,15 @@ struct BenchmarkQueryTimestampNotEqual : BenchmarkWithTimestamps {
         ConstTableRef table = m_table;
         Query query = table->where().not_equal(m_col, needle);
         TableView results = query.find_all();
-        REALM_ASSERT_EX(results.size() == values.size() - values.count(needle) + num_nulls_added, results.size(), values.size(), values.count(needle));
+        REALM_ASSERT_EX(results.size() == values.size() - values.count(needle) + num_nulls_added, results.size(),
+                        values.size(), values.count(needle));
         static_cast<void>(results);
     }
 };
 
 struct BenchmarkQueryTimestampNotNull : BenchmarkWithTimestamps {
-    void before_all(DBRef group) {
+    void before_all(DBRef group)
+    {
         percent_chance_of_null = 0.60f;
         percent_results_to_needle = 0.0;
         BenchmarkWithTimestamps::before_all(group);
@@ -829,13 +1090,15 @@ struct BenchmarkQueryTimestampNotNull : BenchmarkWithTimestamps {
         ConstTableRef table = m_table;
         Query query = table->where().not_equal(m_col, realm::null());
         TableView results = query.find_all();
-        REALM_ASSERT_EX(results.size() == values.size(), results.size(), num_nulls_added, num_results_to_needle, values.size());
+        REALM_ASSERT_EX(results.size() == values.size(), results.size(), num_nulls_added, num_results_to_needle,
+                        values.size());
         static_cast<void>(results);
     }
 };
 
 struct BenchmarkQueryTimestampEqualNull : BenchmarkWithTimestamps {
-    void before_all(DBRef group) {
+    void before_all(DBRef group)
+    {
         percent_chance_of_null = 0.10;
         percent_results_to_needle = 0.0;
         BenchmarkWithTimestamps::before_all(group);
@@ -1117,6 +1380,24 @@ struct BenchmarkQueryChainedOrInts : BenchmarkWithIntsTable {
     }
 };
 
+struct BenchmarkQueryChainedOrIntsCount : BenchmarkQueryChainedOrInts {
+    const char* name() const
+    {
+        return "QueryChainedOrIntsCount";
+    }
+
+    void operator()(DBRef)
+    {
+        ConstTableRef table = m_table;
+        Query query = table->where();
+        for (size_t i = 0; i < values_to_query.size(); ++i) {
+            query.Or().equal(m_col, values_to_query[i]);
+        }
+        size_t matches = query.count();
+        REALM_ASSERT_EX(matches == num_queried_matches, matches, num_queried_matches, values_to_query.size());
+    }
+};
+
 struct BenchmarkQueryChainedOrIntsIndexed : BenchmarkQueryChainedOrInts {
     const char* name() const
     {
@@ -1163,6 +1444,52 @@ struct BenchmarkQueryIntEqualityIndexed : BenchmarkQueryIntEquality {
         TableRef t = tr.get_table(name());
         t->add_search_index(m_col);
         tr.commit();
+    }
+};
+
+struct BenchmarkForeignAggAvg : BenchmarkWithIntsTable {
+    ColKey m_double_col;
+    Random m_rand;
+    const size_t num_queried_matches = 1000;
+    const size_t num_rows = BASE_SIZE;
+    std::vector<int64_t> values_to_query;
+
+    const char* name() const
+    {
+        return "QueryWithForeignAggAvg";
+    }
+
+    void before_all(DBRef group)
+    {
+        BenchmarkWithIntsTable::before_all(group);
+        WriteTransaction tr(group);
+        TableRef t = tr.get_table(name());
+        m_double_col = t->add_column(type_Double, "double_col");
+        std::vector<ObjKey> keys;
+        t->create_objects(num_rows, keys);
+        REALM_ASSERT(num_rows > num_queried_matches);
+        Random r;
+        size_t i = 0;
+        for (auto e : *t) {
+            e.set<Int>(m_col, i).set<Double>(m_double_col, double(i));
+            ++i;
+        }
+        for (i = 0; i < num_queried_matches; ++i) {
+            size_t ndx_to_match = (num_rows / num_queried_matches) * i;
+            values_to_query.push_back(t->get_object(ndx_to_match).get<Int>(m_col));
+        }
+        tr.commit();
+    }
+
+    void operator()(DBRef)
+    {
+        ConstTableRef table = m_table;
+        for (size_t i = 0; i < 50; ++i) {
+            auto result = table->where()
+                              .not_equal(m_col, values_to_query[m_rand.draw_int<size_t>(0, values_to_query.size())])
+                              .avg(m_double_col);
+            REALM_ASSERT(result);
+        }
     }
 };
 
@@ -1253,6 +1580,38 @@ struct BenchmarkQueryChainedOrStrings : BenchmarkWithStringsTableForIn {
             query.Or().equal(m_col, StringData(values_to_query[i]));
         }
         TableView results = query.find_all();
+        REALM_ASSERT_EX(results.size() == num_queried_matches, results.size(), num_queried_matches,
+                        values_to_query.size());
+        static_cast<void>(results);
+    }
+};
+
+struct BenchmarkQueryChainedOrStringsPredicate : BenchmarkWithStringsTableForIn {
+    std::set<std::string> uniq;
+
+    void before_all(DBRef group)
+    {
+        create_table(group, false);
+        uniq = std::set<std::string>(values_to_query.begin(), values_to_query.end());
+    }
+};
+
+struct BenchmarkQueryChainedOrStringsViewFilterPredicate : BenchmarkQueryChainedOrStringsPredicate {
+    const char* name() const
+    {
+        return "QueryChainedOrStringsViewFilterPredicate";
+    }
+
+    void operator()(DBRef)
+    {
+        ConstTableRef table = m_table;
+
+        auto predicate = [this](const Obj& obj) {
+            return uniq.find(obj.get<String>(m_col)) != uniq.end();
+        };
+
+        TableView results = table->where().find_all();
+        results.filter(FilterDescriptor(predicate));
         REALM_ASSERT_EX(results.size() == num_queried_matches, results.size(), num_queried_matches,
                         values_to_query.size());
         static_cast<void>(results);
@@ -1581,7 +1940,8 @@ struct BenchmarkQueryInsensitiveString : BenchmarkWithStringsTable {
         return str;
     }
 
-    size_t rand() {
+    size_t rand()
+    {
         return seeded_rand.draw_int<size_t>();
     }
 
@@ -1699,7 +2059,6 @@ struct BenchmarkQueryNot : Benchmark {
         tr.get_group().remove_table(name());
         tr.commit();
     }
-
 };
 
 struct BenchmarkGetLinkList : Benchmark {
@@ -1760,7 +2119,7 @@ struct BenchmarkNonInitiatorOpen : Benchmark {
 
     DBRef do_open()
     {
-        return DB::create(*path, false, DBOptions(m_durability, m_encryption_key));
+        return DB::create(*path, DBOptions(m_durability, m_encryption_key));
     }
 
     void before_all(DBRef)
@@ -2191,7 +2550,6 @@ void run_benchmark_once(Benchmark& benchmark, DBRef sg, Timer& timer)
     timer.unpause();
 }
 
-
 /// This little piece of likely over-engineering runs the benchmark a number of times,
 /// with each durability setting, and reports the results for each run.
 template <typename B>
@@ -2217,7 +2575,7 @@ void run_benchmark(BenchmarkResults& results, bool force_full = false)
         const char* key = it->second;
 
         B benchmark;
-        if (!g_bench_filter.empty() && g_bench_filter.find(benchmark.name()) == g_bench_filter.end())
+        if (should_filter_benchmark(benchmark.name()))
             return;
 
         benchmark.m_durability = level;
@@ -2242,7 +2600,7 @@ void run_benchmark(BenchmarkResults& results, bool force_full = false)
         realm::test_util::DBTestPathGuard realm_path(
             test_util::get_test_path("benchmark_common_tasks_" + ident, ".realm"));
         DBRef group;
-        group = DB::create(realm_path, false, DBOptions(level, key));
+        group = DB::create(realm_path, DBOptions(level, key));
         benchmark.before_all(group);
 
         // Warm-up and initial measuring:
@@ -2290,7 +2648,7 @@ int benchmark_common_tasks_main()
     results_file_stem += "results";
     BenchmarkResults results(40, "benchmark-common-tasks", results_file_stem.c_str());
 
-#define BENCH(B) run_benchmark<B>(results)
+#define BENCH(...) run_benchmark<__VA_ARGS__>(results)
 #define BENCH2(B, mode) run_benchmark<B>(results, mode)
     BENCH2(BenchmarkEmptyCommit, true);
     BENCH2(BenchmarkEmptyCommit, false);
@@ -2340,12 +2698,15 @@ int benchmark_common_tasks_main()
     BENCH(BenchmarkQueryInsensitiveStringIndexed);
     BENCH(BenchmarkQueryChainedOrStrings<false>);
     BENCH(BenchmarkQueryChainedOrStrings<true>);
+    BENCH(BenchmarkQueryChainedOrStringsViewFilterPredicate);
     BENCH(BenchmarkQueryNotChainedOrStrings<false>);
     BENCH(BenchmarkQueryNotChainedOrStrings<true>);
     BENCH(BenchmarkQueryChainedOrInts);
     BENCH(BenchmarkQueryChainedOrIntsIndexed);
+    BENCH(BenchmarkQueryChainedOrIntsCount);
     BENCH(BenchmarkQueryIntEquality);
     BENCH(BenchmarkQueryIntEqualityIndexed);
+    BENCH(BenchmarkForeignAggAvg);
     BENCH(BenchmarkIntVsDoubleColumns);
     BENCH(BenchmarkQueryStringOverLinks);
     BENCH(BenchmarkSubQuery);
@@ -2357,12 +2718,46 @@ int benchmark_common_tasks_main()
     BENCH(BenchmarkWithType<Prop<ObjectId>>);
     BENCH(BenchmarkWithType<Indexed<Timestamp>>);
     BENCH(BenchmarkWithType<Prop<Timestamp>>);
+    BENCH(BenchmarkWithType<Indexed<Int>>);
+    BENCH(BenchmarkWithType<Indexed<String>>);
     BENCH(BenchmarkWithType<Indexed<Bool>>);
     BENCH(BenchmarkWithType<Prop<Bool>>);
     BENCH(BenchmarkMixedCaseInsensitiveEqual<Prop<Mixed>>);
     BENCH(BenchmarkMixedCaseInsensitiveEqual<Indexed<Mixed>>);
     BENCH(BenchmarkMixedCaseInsensitiveEqual<Prop<String>>);
     BENCH(BenchmarkMixedCaseInsensitiveEqual<Indexed<String>>);
+
+    BENCH(BenchmarkParsedChainedOrEquality<Indexed<UUID>, 5000>);
+    BENCH(BenchmarkParsedChainedOrEquality<Indexed<ObjectId>, 5000>);
+    BENCH(BenchmarkParsedChainedOrEquality<Prop<UUID>, 5000>);
+    BENCH(BenchmarkParsedChainedOrEquality<Prop<ObjectId>, 5000>);
+    BENCH(BenchmarkParsedIn<Indexed<UUID>, 5000>);
+    BENCH(BenchmarkParsedIn<Indexed<ObjectId>, 5000>);
+    BENCH(BenchmarkParsedIn<Prop<UUID>, 5000>);
+    BENCH(BenchmarkParsedIn<Prop<ObjectId>, 5000>);
+    BENCH(BenchmarkParsedIn<Indexed<UUID>, 5>);
+    BENCH(BenchmarkParsedIn<Indexed<ObjectId>, 5>);
+    BENCH(BenchmarkParsedIn<Prop<UUID>, 5>);
+    BENCH(BenchmarkParsedIn<Prop<ObjectId>, 5>);
+
+    BENCH(BenchmarkRangeForType<Prop<Int>>);
+    BENCH(BenchmarkCreateIndexForType<NullableIndexed<String>>);
+    BENCH(BenchmarkCreateIndexForType<NullableIndexed<Int>>);
+    BENCH(BenchmarkCreateIndexForType<NullableIndexed<Timestamp>>);
+
+    BENCH(BenchmarkInsertToIndexForType<NullableIndexed<String>>);
+    BENCH(BenchmarkInsertToIndexForType<NullableIndexed<Int>>);
+    BENCH(BenchmarkInsertToIndexForType<NullableIndexed<Timestamp>>);
+
+    BENCH(BenchmarkInsertPKToIndexForType<NullableIndexed<String>>);
+    BENCH(BenchmarkInsertPKToIndexForType<NullableIndexed<Int>>);
+
+    BENCH(BenchmarkEraseObjectForType<Prop<String>>);
+    BENCH(BenchmarkEraseObjectForType<Prop<Int>>);
+    BENCH(BenchmarkEraseObjectForType<Prop<Timestamp>>);
+    BENCH(BenchmarkEraseObjectForType<NullableIndexed<String>>);
+    BENCH(BenchmarkEraseObjectForType<NullableIndexed<Int>>);
+    BENCH(BenchmarkEraseObjectForType<NullableIndexed<Timestamp>>);
 
     BENCH(BenchmarkQueryTimestampGreaterOverLinks);
     BENCH(BenchmarkQueryTimestampGreater);
@@ -2412,7 +2807,8 @@ int main(int argc, const char** argv)
                       << "  -h, --help      display this help" << std::endl
                       << "  PATH            alternate path to store the results files;" << std::endl
                       << "                  this path should end with a slash." << std::endl
-                      << "  NAMES           benchmark names to run (',' separated)" << std::endl
+                      << "  NAMES           benchmark names to run (':' separated)" << std::endl
+                      << "                  Full regex is supported as a filter for a name" << std::endl
                       << std::endl;
             return 1;
         }
@@ -2424,9 +2820,9 @@ int main(int argc, const char** argv)
     if (argc > 2) {
         std::string filter = argv[2];
         for (size_t i = 0, j = 0, len = filter.size(); i <= len; ++i) {
-            if (i == len || filter[i] == ',') {
+            if (i == len || filter[i] == ':') {
                 if (j < i)
-                    g_bench_filter.insert(filter.substr(j, i - j));
+                    g_bench_filter.emplace_back(filter.substr(j, i - j));
                 j = i + 1;
             }
         }

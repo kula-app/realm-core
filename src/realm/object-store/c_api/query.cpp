@@ -166,6 +166,10 @@ struct QueryArgumentsAdapter : query_parser::Arguments {
                 return type_Decimal;
             case RLM_TYPE_UUID:
                 return type_UUID;
+            case RLM_TYPE_LIST:
+                return type_List;
+            case RLM_TYPE_DICTIONARY:
+                return type_Dictionary;
         }
         throw LogicError{ErrorCodes::TypeMismatch, "Unsupported type"}; // LCOV_EXCL_LINE
         return type_Int;
@@ -330,9 +334,8 @@ RLM_API realm_results_t* realm_get_backlinks(realm_object_t* object, realm_class
     return wrap_err([&]() {
         object->verify_attached();
         auto realm = object->realm();
-        auto source_table = realm->read_group().get_table(TableKey{source_table_key});
-        auto backlink_view = object->get_obj().get_backlink_view(source_table, ColKey{property_key});
-        return new realm_results_t{Results{realm, backlink_view}};
+        return new realm_results_t{
+            Results{realm, object->get_obj(), TableKey{source_table_key}, ColKey{property_key}}};
     });
 }
 
@@ -402,6 +405,28 @@ RLM_API bool realm_results_get(realm_results_t* results, size_t index, realm_val
             *out_value = to_capi(mixed);
         }
         return true;
+    });
+}
+
+RLM_API realm_list_t* realm_results_get_list(realm_results_t* results, size_t index)
+{
+    return wrap_err([&]() {
+        realm_list_t* out = nullptr;
+        auto result_list = results->get_list(index);
+        if (result_list.is_valid())
+            out = new realm_list_t{result_list};
+        return out;
+    });
+}
+
+RLM_API realm_dictionary_t* realm_results_get_dictionary(realm_results_t* results, size_t index)
+{
+    return wrap_err([&]() {
+        realm_dictionary_t* out = nullptr;
+        auto result_dictionary = results->get_dictionary(index);
+        if (result_dictionary.is_valid())
+            out = new realm_dictionary_t{result_dictionary};
+        return out;
     });
 }
 

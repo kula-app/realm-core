@@ -32,7 +32,6 @@
 #include <realm/object-store/util/scheduler.hpp>
 
 #if REALM_ENABLE_SYNC
-#include <realm/object-store/sync/impl/sync_file.hpp>
 #include <realm/object-store/sync/async_open_task.hpp>
 #include <realm/object-store/sync/sync_manager.hpp>
 #include <realm/object-store/sync/sync_session.hpp>
@@ -65,7 +64,7 @@ std::shared_ptr<RealmCoordinator> RealmCoordinator::get_coordinator(StringData p
         return coordinator;
     }
 
-    auto coordinator = std::make_shared<RealmCoordinator>();
+    auto coordinator = std::make_shared<RealmCoordinator>(Private());
     weak_coordinator = coordinator;
     return coordinator;
 }
@@ -133,6 +132,10 @@ void RealmCoordinator::set_config(const Realm::Config& config)
             throw InvalidArgument(ErrorCodes::IllegalCombination,
                                   "Cannot specify a partition value when flexible sync is enabled");
         }
+        if (!config.sync_config->user) {
+            throw InvalidArgument(ErrorCodes::IllegalCombination,
+                                  "A user must be provided to open a synchronized Realm.");
+        }
     }
 #endif
 
@@ -188,7 +191,6 @@ void RealmCoordinator::set_config(const Realm::Config& config)
                     ErrorCodes::MismatchedConfig,
                     util::format("Realm at path '%1' already opened with different sync user.", config.path));
             }
-
             if (m_config.sync_config->partition_value != config.sync_config->partition_value) {
                 throw LogicError(
                     ErrorCodes::MismatchedConfig,
@@ -389,8 +391,10 @@ void RealmCoordinator::do_get_realm(RealmConfig&& config, std::shared_ptr<Realm>
         if (!first_time_open)
             first_time_open = db_created;
         if (subscription_version == 0 || (first_time_open && rerun_on_open)) {
-            // if the tasks is cancelled, the subscription may or may not be run.
+            bool was_in_read = realm->is_in_read_transaction();
             subscription_function(realm);
+            if (!was_in_read)
+                realm->invalidate();
         }
     }
 #endif
@@ -418,7 +422,8 @@ std::shared_ptr<AsyncOpenTask> RealmCoordinator::get_synchronized_realm(Realm::C
     util::CheckedLockGuard lock(m_realm_mutex);
     set_config(config);
     const auto db_open_first_time = open_db();
-    return std::make_shared<AsyncOpenTask>(shared_from_this(), m_sync_session, db_open_first_time);
+    return std::make_shared<AsyncOpenTask>(AsyncOpenTask::Private(), shared_from_this(), m_sync_session,
+                                           db_open_first_time);
 }
 
 #endif
@@ -430,10 +435,13 @@ bool RealmCoordinator::open_db()
 
 #if REALM_ENABLE_SYNC
     if (m_config.sync_config) {
+        REALM_ASSERT(m_config.sync_config->user);
         // If we previously opened this Realm, we may have a lingering sync
         // session which outlived its RealmCoordinator. If that happens we
         // want to reuse it instead of creating a new DB.
-        m_sync_session = m_config.sync_config->user->sync_manager()->get_existing_session(m_config.path);
+        if (auto sync_manager = m_config.sync_config->user->sync_manager()) {
+            m_sync_session = sync_manager->get_existing_session(m_config.path);
+        }
         if (m_sync_session) {
             m_db = SyncSession::Internal::get_db(*m_sync_session);
             init_external_helpers();
@@ -476,6 +484,7 @@ bool RealmCoordinator::open_db()
         }
         options.encryption_key = m_config.encryption_key.data();
         options.allow_file_format_upgrade = !m_config.disable_format_upgrade && !schema_mode_reset_file;
+        options.clear_on_invalid_file = m_config.clear_on_invalid_file;
         if (history) {
             options.backup_at_file_format_change = m_config.backup_at_file_format_change;
 #ifdef __EMSCRIPTEN__
@@ -493,7 +502,8 @@ bool RealmCoordinator::open_db()
 #endif
         }
         else {
-            m_db = DB::create(m_config.path, true, options);
+            options.no_create = true;
+            m_db = DB::create(m_config.path, options);
         }
     }
     catch (realm::FileFormatUpgradeRequired const&) {
@@ -533,9 +543,19 @@ void RealmCoordinator::init_external_helpers()
     // happens on background threads, so to avoid needing locking on every access
     // we have to wire things up in a specific order.
 #if REALM_ENABLE_SYNC
-    // We may have reused an existing sync session that outlived its original RealmCoordinator
-    if (m_config.sync_config && !m_sync_session)
-        m_sync_session = m_config.sync_config->user->sync_manager()->get_session(m_db, m_config);
+    // We may have reused an existing sync session that outlived its original
+    // RealmCoordinator. If not, we need to create a new one now.
+    if (m_config.sync_config && !m_sync_session) {
+        if (!m_config.sync_config->user || m_config.sync_config->user->state() == SyncUser::State::Removed) {
+            throw app::AppError(
+                ErrorCodes::ClientUserNotFound,
+                util::format("Cannot start a sync session for user '%1' because this user has been removed.",
+                             m_config.sync_config->user->user_id()));
+        }
+        if (auto sync_manager = m_config.sync_config->user->sync_manager()) {
+            m_sync_session = sync_manager->get_session(m_db, m_config);
+        }
+    }
 #endif
 
     if (!m_notifier && !m_config.immutable() && m_config.automatic_change_notifications) {
@@ -548,18 +568,7 @@ void RealmCoordinator::init_external_helpers()
                                   ex.code().value());
         }
     }
-
-#if REALM_ENABLE_SYNC
-    if (m_sync_session) {
-        std::weak_ptr<RealmCoordinator> weak_self = shared_from_this();
-        SyncSession::Internal::set_sync_transact_callback(*m_sync_session, [weak_self](VersionID, VersionID) {
-            if (auto self = weak_self.lock()) {
-                if (self->m_notifier)
-                    self->m_notifier->notify_others();
-            }
-        });
-    }
-#endif
+    m_db->add_commit_listener(this);
 }
 
 void RealmCoordinator::close()
@@ -634,7 +643,7 @@ void RealmCoordinator::advance_schema_cache(uint64_t previous, uint64_t next)
     m_schema_transaction_version_max = std::max(next, m_schema_transaction_version_max);
 }
 
-RealmCoordinator::RealmCoordinator() = default;
+RealmCoordinator::RealmCoordinator(Private) {}
 
 RealmCoordinator::~RealmCoordinator()
 {
@@ -649,11 +658,17 @@ RealmCoordinator::~RealmCoordinator()
             }
         }
     }
-    // Waits for the worker thread to join
-    m_notifier = nullptr;
 
-    // Ensure the notifiers aren't holding on to Transactions after we destroy
-    // the History object the DB depends on
+    if (m_db) {
+        m_db->remove_commit_listener(this);
+    }
+
+    // Waits for the worker thread to join
+    m_notifier.reset();
+
+    // If there's any active NotificationTokens they'll keep the notifiers alive,
+    // so tell the notifiers to release their Transactions so that the DB can
+    // be closed immediately.
     // No locking needed here because the worker thread is gone
     for (auto& notifier : m_new_notifiers)
         notifier->release_data();
@@ -789,16 +804,6 @@ void RealmCoordinator::commit_write(Realm& realm, bool commit_to_disk)
         }
     }
 
-#if REALM_ENABLE_SYNC
-    // Realm could be closed in did_change. So send sync notification first before did_change.
-    if (m_sync_session) {
-        SyncSession::Internal::nonsync_transact_notify(*m_sync_session, new_version.version);
-    }
-#endif
-    if (m_notifier) {
-        m_notifier->notify_others();
-    }
-
     if (realm.m_binding_context) {
         realm.m_binding_context->did_change({}, {});
     }
@@ -865,6 +870,13 @@ void RealmCoordinator::clean_up_dead_notifiers()
         m_notifier_skip_version.reset();
     }
     swap_remove(m_new_notifiers);
+}
+
+void RealmCoordinator::on_commit(DB::version_type)
+{
+    if (m_notifier) {
+        m_notifier->notify_others();
+    }
 }
 
 void RealmCoordinator::on_change()
@@ -998,7 +1010,7 @@ void RealmCoordinator::run_async_notifiers()
         // first collection with the same id. It is O(N^2), but typically the
         // number of collections observed will be very small.
         auto id = [](auto const& c) {
-            return std::tie(c.table_key, c.col_key, c.obj_key);
+            return std::tie(c.table_key, c.path, c.obj_key);
         };
         auto& collections = change_info.collections;
         for (size_t i = collections.size(); i > 0; --i) {

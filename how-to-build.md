@@ -145,46 +145,42 @@ These are the available variables:
    testing process as soon as a check fails or an unexpected exception is thrown
    in a test.
 
-## Running [app] tests against a local MongoDB Stitch
+## Running [app] tests against a local BAAS instance
 
-Due to MongoDB security policies, running baas requires company issued AWS account credentials.
-These are for MongoDB employees only, if you do not have these, reach out to #realm-core.
-Once you have them, they need to be passed to the docker image below. If the credentials are not
-passed in correctly, the docker image will block at the message "Starting Stitch..." forever.
-
-First, log in to aws using their command line tool. On mac this requries `brew install awscli`.
-Then login using `aws configure` and input your access key and secret acess key. The other 
-configuration options can be left as none. This creates a correctly formatted file locally at
-`~/.aws/credentials` which we will use later when starting docker.
-
-If you do not want to install the aws command line tools, you can also create the aws file
-manually in the correct location (`~/.aws/credentials`) with the following contents:
-
+If you already have a baas instance running, you can specify that directly via the
+`BAAS_BASE_URL` environment variable. You can run baas in a local docker container using
+instructions from [the wiki](https://wiki.corp.mongodb.com/display/10GEN/%28Device+Sync%29+Using+Docker+to+run+a+BAAS+server+instance).
 ```
-AWS_ACCESS_KEY_ID = <your-key-id>
-AWS_SECRET_ACCESS_KEY = <your-secret-key>
-```
-
-Stitch images are published to our private Github CI. Follow the steps here to
-set up authorization from docker to your Github account https://github.com/realm/ci/tree/master/realm/docker/mongodb-realm
-Once authorized, run the following docker command from the top directory to start a local instance:
-
-```
-export MDBREALM_TEST_SERVER_TAG=$(grep MDBREALM_TEST_SERVER_TAG dependencies.list |cut -f 2 -d=)
-docker run --rm -p 9090:9090 -v ~/.aws/credentials:/root/.aws/credentials -it ghcr.io/realm/ci/mongodb-realm-test-server:${MDBREALM_TEST_SERVER_TAG}
-```
-
-This will make the stitch UI available in your browser at `localhost:9090` where you can login with "unique_user@domain.com" and "password".
-Once logged in, you can make changes to the integration-tests app and those changes will be persisted to your disk, because the docker image
-has a mapped volume to the `tests/mongodb` directory.
-
-To run the [app] tests against the local image, you need to configure a build with some cmake options to tell the tests where to point to.
-```
+export BAAS_BASE_URL=http://localhost:9090
 mkdir build.sync.ninja
-cmake -B build.sync.ninja -G Ninja -DREALM_ENABLE_AUTH_TESTS=1 -DREALM_MONGODB_ENDPOINT=http://localhost:9090
+cmake -B build.sync.ninja -G Ninja -DREALM_ENABLE_AUTH_TESTS=1
 cmake --build build.sync.ninja --target realm-object-store-tests
 ./build.sync.ninja/test/object-store/realm-object-store-tests -d=1
 ```
+
+## Running [app] tests against an on-demand BAASAAS container
+
+Due to MongoDB security policies, running baas requires company issued credentials.
+These are for MongoDB employees only, if you do not have these, reach out to
+#appx-device-sync-internal. Once you have a baasaas API key, it needs to be set
+in the shell environment.
+```
+export BAASAAS_API_KEY=<your API key here>
+mkdir build.sync.ninja
+cmake -B build.sync.ninja -G Ninja -DREALM_ENABLE_AUTH_TESTS=1
+cmake --build build.sync.ninja --target realm-object-store-tests
+./build.sync.ninja/test/object-store/realm-object-store-tests -d=1
+```
+You can tell the object-store tests to use a specific version of baas with the
+`BAASAAS_START_MODE` environment variable, which can either be `githash`, `patchid`,
+or `branch`. If you specify a start mode, you need to tell it which githash or
+branch name to start with via the `BAASAAS_REF_SPEC` environment variable. Omitting
+these will use the latest available commit from the main branch of baas.
+
+If you've started a baasaas container already via the baasaas CLI, you can tell
+the object-store tests to use that with the `BAASAAS_INSTANCE_ID` environment variable.
+
+
 ### Developing inside a container
 
 The `.devcontainer` folders contains configuration for the [Visual Studio Code Remote - Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension, which allows you to develop inside the same Docker container that CI runs in, which is especially useful because it also sets up the MongoDB Realm Test Server container. Make sure you have the `Remote - Containers` extension installed (it's part of the recommended extensions list for this repository) and run the `Remote-Containers: Reopen in Container` (or `Rebuild and Reopen in Container`) command. VSCode will build the image described in `Dockerfile`, spin up a container group using Docker Compose, and reopen the workspace from inside the container.

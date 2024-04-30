@@ -1,7 +1,4 @@
 set(HEADERS
-    ../util/crypt_key.hpp
-    ../util/spawned_process.hpp
-    ../util/test_path.hpp
     util/event_loop.hpp
     util/index_helpers.hpp
     util/test_file.hpp
@@ -10,13 +7,15 @@ set(HEADERS
 )
 
 set(SOURCES
+    # slowest to compile first
+    set.cpp
+
     backup.cpp
     collection_change_indices.cpp
     dictionary.cpp
     frozen_objects.cpp
     index_set.cpp
     list.cpp
-    main.cpp
     migrations.cpp
     object.cpp
     object_store.cpp
@@ -25,16 +24,14 @@ set(SOURCES
     results.cpp
     schema.cpp
     sectioned_results.cpp
-    set.cpp
+    test_runner.cpp
     thread_safe_reference.cpp
     transaction_log_parsing.cpp
     uuid.cpp
+    nested_collections.cpp
     c_api/c_api.cpp
-    c_api/c_api.c
+    c_api/c_api_file_tests.c
 
-    ../util/crypt_key.cpp
-    ../util/spawned_process.cpp
-    ../util/test_path.cpp
     util/event_loop.cpp
     util/test_file.cpp
     util/test_utils.cpp
@@ -44,9 +41,7 @@ if (REALM_ENABLE_GEOSPATIAL)
     list(APPEND SOURCES geospatial.cpp)
 endif()
 
-file(GLOB RESOURCES RELATIVE ${CMAKE_CURRENT_BINARY_DIR}
-    ../*.pem
-     *.realm)
+file(GLOB RESOURCES "*.realm" "../*.pem")
 
 if(REALM_ENABLE_AUTH_TESTS)
     list(APPEND SOURCES util/sync/baas_admin_api.cpp)
@@ -55,45 +50,65 @@ endif()
 if(REALM_ENABLE_SYNC)
     list(APPEND HEADERS
         util/sync/baas_admin_api.hpp
-        util/sync/flx_sync_harness.hpp
         util/sync/session_util.hpp
         util/sync/sync_test_utils.hpp
-        util/unit_test_transport.hpp
     )
     list(APPEND SOURCES
         bson.cpp
-        sync/app.cpp
-        sync/client_reset.cpp
         sync/file.cpp
-        sync/flx_migration.cpp
-        sync/flx_sync.cpp
-        sync/metadata.cpp
-        sync/migration_store_test.cpp
-        sync/remote_mongo_tests.cpp
         sync/session/connection_change_notifications.cpp
         sync/session/progress_notifications.cpp
         sync/session/session.cpp
         sync/session/wait_for_completion.cpp
         sync/sync_manager.cpp
-        sync/user.cpp
         util/sync/sync_test_utils.cpp
-        util/unit_test_transport.cpp
     )
+
+    if (REALM_APP_SERVICES)
+        list(APPEND HEADERS
+            util/sync/flx_sync_harness.hpp
+            util/unit_test_transport.hpp
+        )
+        list(APPEND SOURCES
+            sync/app.cpp
+            sync/client_reset.cpp
+            sync/flx_migration.cpp
+            sync/flx_schema_migration.cpp
+            sync/flx_sync.cpp
+            sync/metadata.cpp
+            sync/migration_store_test.cpp
+            sync/remote_mongo_tests.cpp
+            util/unit_test_transport.cpp
+        )
+    endif()
+
     if(APPLE)
         list(APPEND SOURCES audit.cpp)
     endif()
 endif()
 
-add_executable(ObjectStoreTests ${SOURCES} ${HEADERS} ${RESOURCES})
-set_target_properties(ObjectStoreTests PROPERTIES OUTPUT_NAME realm-object-store-tests)
-set_target_resources(ObjectStoreTests "${RESOURCES}")
+set_property(DIRECTORY PROPERTY TEST_RESOURCES "${RESOURCES}")
+
+add_library(ObjectStoreTestLib OBJECT ${SOURCES} ${HEADERS} ${RESOURCES})
 
 if(MSVC)
     # increase the number of sections supported in an obj file for the heavily templated tests
-    target_compile_options(ObjectStoreTests PRIVATE /bigobj)
+    target_compile_options(ObjectStoreTestLib PRIVATE /bigobj)
 endif()
 
-target_link_libraries(ObjectStoreTests Catch2::Catch2 ObjectStore RealmFFIStatic)
+target_link_libraries(ObjectStoreTestLib Catch2::Catch2 ObjectStore RealmFFIStatic TestUtil)
+enable_stdfilesystem(ObjectStoreTestLib)
+
+if(REALM_CURL_CACERTS)
+  target_compile_definitions(ObjectStoreTestLib PRIVATE
+    REALM_CURL_CACERTS="${REALM_CURL_CACERTS}"
+  )
+endif()
+
+add_executable(ObjectStoreTests main.cpp ${RESOURCES})
+set_target_properties(ObjectStoreTests PROPERTIES OUTPUT_NAME realm-object-store-tests)
+target_link_libraries(ObjectStoreTests ObjectStoreTestLib TestUtil)
+set_target_resources(ObjectStoreTests "${RESOURCES}")
 enable_stdfilesystem(ObjectStoreTests)
 create_coverage_target(generate-coverage ObjectStoreTests)
 
@@ -126,39 +141,60 @@ if(REALM_ENABLE_SYNC)
 endif()
 
 if(REALM_ENABLE_SYNC)
-    target_link_libraries(ObjectStoreTests SyncServer)
+    target_link_libraries(ObjectStoreTestLib SyncServer)
     option(REALM_ENABLE_AUTH_TESTS "" OFF)
     if(REALM_ENABLE_AUTH_TESTS)
-        if(NOT REALM_MONGODB_ENDPOINT)
-            message(FATAL_ERROR "REALM_MONGODB_ENDPOINT must be set when specifying REALM_ENABLE_AUTH_TESTS.")
+        if (NOT REALM_APP_SERVICES)
+            message(SEND_ERROR "Unsupported configuration: REALM_ENABLE_AUTH_TESTS=ON and REALM_APP_SERVICES=OFF")
         endif()
 
-        target_compile_definitions(ObjectStoreTests PRIVATE
+        target_compile_definitions(ObjectStoreTestLib PRIVATE
             REALM_ENABLE_AUTH_TESTS=1
-            REALM_MONGODB_ENDPOINT="${REALM_MONGODB_ENDPOINT}"
         )
 
+        if(REALM_MONGODB_ENDPOINT)
+          message(STATUS "Auth tests enabled: ${REALM_MONGODB_ENDPOINT}")
+          target_compile_definitions(ObjectStoreTestLib PRIVATE
+              REALM_MONGODB_ENDPOINT="${REALM_MONGODB_ENDPOINT}"
+          )
+        endif()
+
+        if(REALM_ADMIN_ENDPOINT)
+            message(STATUS "BAAS admin endpoint: ${REALM_ADMIN_ENDPOINT}")
+            target_compile_definitions(ObjectStoreTests PRIVATE
+                REALM_ADMIN_ENDPOINT="${REALM_ADMIN_ENDPOINT}"
+            )
+        endif()
+
         find_package(CURL REQUIRED)
-        target_link_libraries(ObjectStoreTests CURL::libcurl)
+        target_link_libraries(ObjectStoreTestLib "${CURL_LIBRARY}")
+        target_include_directories(ObjectStoreTestLib PRIVATE "${CURL_INCLUDE_DIRS}")
     endif()
 endif()
 
 if(REALM_TEST_LOGGING)
-    target_compile_definitions(ObjectStoreTests PRIVATE
+    target_compile_definitions(ObjectStoreTestLib PRIVATE
         TEST_ENABLE_LOGGING=1
     )
 
     if(REALM_TEST_LOGGING_LEVEL)
         message(STATUS "Test logging level: ${REALM_TEST_LOGGING_LEVEL}")
-        target_compile_definitions(ObjectStoreTests PRIVATE
+        target_compile_definitions(ObjectStoreTestLib PRIVATE
             TEST_LOGGING_LEVEL=${REALM_TEST_LOGGING_LEVEL}
         )
-    else()
-        message(STATUS "Test logging enabled")
     endif()
+    message(STATUS "Test logging enabled")
 endif()
 
-target_include_directories(ObjectStoreTests PRIVATE
+# Optional extra time to add to test timeout values
+if(REALM_TEST_TIMEOUT_EXTRA)
+    target_compile_definitions(ObjectStoreTests PRIVATE
+        TEST_TIMEOUT_EXTRA=${REALM_TEST_TIMEOUT_EXTRA}
+    )
+    message(STATUS "Test wait timeouts extended by ${REALM_TEST_TIMEOUT_EXTRA} seconds")
+endif()
+
+target_include_directories(ObjectStoreTestLib PRIVATE
     ${CATCH_INCLUDE_DIR}
     ${JSON_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -167,7 +203,7 @@ target_include_directories(ObjectStoreTests PRIVATE
 # on Apple platforms we use the built-in CFRunLoop
 # on WebAssembly we use an Emscripten-specific Scheduler and runloop
 # everywhere else it's libuv, except UWP where it doesn't build
-if(NOT APPLE AND NOT EMSCRIPTEN AND NOT WINDOWS_STORE)
+if(NOT APPLE AND NOT EMSCRIPTEN AND NOT WINDOWS_STORE AND NOT ANDROID)
     option(REALM_FETCH_MISSING_DEPENDENCIES "Download missing dependencies with CMake's FetchContent where possible" ON)
     if(REALM_FETCH_MISSING_DEPENDENCIES)
         find_package(LibUV)
@@ -179,10 +215,7 @@ if(NOT APPLE AND NOT EMSCRIPTEN AND NOT WINDOWS_STORE)
     elseif(REALM_FETCH_MISSING_DEPENDENCIES)
         message(STATUS "LibUV not found, building from source with FetchContent")
         include(FetchContent)
-        set(libUV_Git_TAG "v1.35.0")
-        if(MSVC)
-            set(liUV_Git_TAG "v1.43.0")
-        endif()
+        set(libUV_Git_TAG "v1.48.0")
         FetchContent_Declare(
             libuv
             GIT_REPOSITORY https://github.com/libuv/libuv.git
@@ -194,8 +227,8 @@ if(NOT APPLE AND NOT EMSCRIPTEN AND NOT WINDOWS_STORE)
         set(libuv_target uv_a)
     endif()
 
-    target_link_libraries(ObjectStoreTests ${libuv_target})
-    target_compile_definitions(ObjectStoreTests PRIVATE TEST_SCHEDULER_UV=1)
+    target_link_libraries(ObjectStoreTestLib ${libuv_target})
+    target_compile_definitions(ObjectStoreTestLib PRIVATE TEST_SCHEDULER_UV=1)
 
     if (MSVC)
         get_target_property(comp_opts ${libuv_target} COMPILE_OPTIONS)
@@ -205,4 +238,7 @@ if(NOT APPLE AND NOT EMSCRIPTEN AND NOT WINDOWS_STORE)
 endif()
 
 add_subdirectory(notifications-fuzzer)
-add_subdirectory(benchmarks)
+
+if(NOT EMSCRIPTEN AND NOT WINDOWS_STORE AND NOT ANDROID)
+    add_subdirectory(benchmarks)
+endif()

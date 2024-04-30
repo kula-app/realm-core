@@ -26,9 +26,62 @@
 
 #include <functional>
 #include <filesystem>
+#include <mutex>
+#include <condition_variable>
 namespace fs = std::filesystem;
 
 namespace realm {
+template <typename E>
+class TestingStateMachine {
+public:
+    explicit TestingStateMachine(E initial_state)
+        : m_cur_state(initial_state)
+    {
+    }
+
+    E get()
+    {
+        std::lock_guard lock{m_mutex};
+        return m_cur_state;
+    }
+
+    void transition_to(E new_state)
+    {
+        {
+            std::lock_guard lock{m_mutex};
+            m_cur_state = new_state;
+        }
+        m_cv.notify_one();
+    }
+
+    template <typename Func>
+    void transition_with(Func&& func)
+    {
+        {
+            std::lock_guard lock{m_mutex};
+            std::optional<E> new_state = func(m_cur_state);
+            if (!new_state) {
+                return;
+            }
+            m_cur_state = *new_state;
+        }
+        m_cv.notify_one();
+    }
+
+    void wait_for(E target)
+    {
+        std::unique_lock lock{m_mutex};
+        m_cv.wait(lock, [&] {
+            return m_cur_state == target;
+        });
+    }
+
+private:
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    E m_cur_state;
+};
+
 template <typename MessageMatcher>
 class ExceptionMatcher final : public Catch::Matchers::MatcherBase<Exception> {
 public:
@@ -130,7 +183,6 @@ std::ostream& operator<<(std::ostream&, const Exception&);
 class Realm;
 /// Open a Realm at a given path, creating its files.
 bool create_dummy_realm(std::string path, std::shared_ptr<Realm>* out = nullptr);
-void reset_test_directory(const std::string& base_path);
 std::vector<char> make_test_encryption_key(const char start = 0);
 void catch2_ensure_section_run_workaround(bool did_run_a_section, std::string section_name,
                                           util::FunctionRef<void()> func);

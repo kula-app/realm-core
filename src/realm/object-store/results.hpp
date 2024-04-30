@@ -36,11 +36,18 @@
 
 namespace realm {
 class Mixed;
+class List;
+class Class;
 class SectionedResults;
 
 namespace _impl {
 class ResultsNotifierBase;
 }
+
+namespace object_store {
+class Dictionary;
+class Set;
+} // namespace object_store
 
 class Results {
 public:
@@ -48,9 +55,14 @@ public:
     // or a wrapper around a query and a sort order which creates and updates
     // the tableview as needed
     Results();
+    Results(const Class&);
     Results(std::shared_ptr<Realm> r, ConstTableRef table);
     Results(std::shared_ptr<Realm> r, Query q, DescriptorOrdering o = {});
     Results(std::shared_ptr<Realm> r, TableView tv, DescriptorOrdering o = {});
+    Results(std::shared_ptr<Realm> r, const Obj& obj, TableKey src_table, ColKey src_col_key)
+        : Results(r, obj.get_backlink_view(r->read_group().get_table(src_table), src_col_key))
+    {
+    }
     Results(std::shared_ptr<Realm> r, std::shared_ptr<CollectionBase> list, DescriptorOrdering o);
     Results(std::shared_ptr<Realm> r, std::shared_ptr<CollectionBase> collection, util::Optional<Query> q = {},
             SortDescriptor s = {});
@@ -113,6 +125,9 @@ public:
     // Get an element in a list
     Mixed get_any(size_t index) REQUIRES(!m_mutex);
 
+    List get_list(size_t index) REQUIRES(!m_mutex);
+    object_store::Dictionary get_dictionary(size_t index) REQUIRES(!m_mutex);
+
     // Get the key/value pair at an index of the results.
     // This method is only valid when applied to a results based on a
     // object_store::Dictionary::get_values(), and will assert this.
@@ -155,6 +170,11 @@ public:
     Results distinct(DistinctDescriptor&& uniqueness) const REQUIRES(!m_mutex);
     // Create a new Results by removing duplicates based on the specified key paths.
     Results distinct(std::vector<std::string> const& keypaths) const REQUIRES(!m_mutex);
+
+    // Create a new Results by filtering using a user supplied function.
+    // The user supplied function can be called from any thread, so it has
+    // to be a pure function or at least thread safe.
+    Results filter_by_method(std::function<bool(const Obj&)>&& predicate) const REQUIRES(!m_mutex);
 
     // Create a new Results with only the first `max_count` entries
     Results limit(size_t max_count) const REQUIRES(!m_mutex);
@@ -391,10 +411,23 @@ auto Results::dispatch(Fn&& fn) const
 }
 
 template <typename Context>
-auto Results::get(Context& ctx, size_t row_ndx)
+auto Results::get(Context& ctx, size_t ndx)
 {
     return dispatch([&](auto t) {
-        return ctx.box(this->get<std::decay_t<decltype(*t)>>(row_ndx));
+        using U = std::decay_t<decltype(*t)>;
+        if constexpr (std::is_same_v<U, Mixed>) {
+            Mixed value = this->get<Mixed>(ndx);
+            if (value.is_type(type_Dictionary)) {
+                return ctx.box(get_dictionary(ndx));
+            }
+            if (value.is_type(type_List)) {
+                return ctx.box(get_list(ndx));
+            }
+            return ctx.box(value);
+        }
+        else {
+            return ctx.box(this->get<U>(ndx));
+        }
     });
 }
 

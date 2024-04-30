@@ -20,6 +20,8 @@
 #include <realm/util/any.hpp>
 #include <realm/version.hpp>
 
+#include <numeric>
+
 using namespace realm;
 using namespace realm::util;
 namespace cf = realm::collection_fixtures;
@@ -1138,6 +1140,10 @@ TEMPLATE_TEST_CASE("set", "[set]", CreateNewSet<void>, ReuseSet<void>)
         REQUIRE(set2().is_valid());
         CHECK(set2().size() == 3);
 
+        SECTION("set is a superset of set2") {
+            REQUIRE(set().is_superset_of(set2()));
+            REQUIRE_FALSE(set2().is_superset_of(set()));
+        }
         SECTION("set2 is a subset of set") {
             REQUIRE(set2().is_subset_of(set()));
             REQUIRE_FALSE(set().is_subset_of(set2()));
@@ -1384,7 +1390,6 @@ TEMPLATE_TEST_CASE("set", "[set]", CreateNewSet<void>, ReuseSet<void>)
 
 TEST_CASE("set with mixed links", "[set]") {
     InMemoryTestFile config;
-    config.cache = false;
     config.automatic_change_notifications = false;
     config.schema = Schema{
         {"object", {{"value", PropertyType::Set | PropertyType::Mixed | PropertyType::Nullable}}},

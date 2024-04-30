@@ -1193,17 +1193,16 @@ bool ServerHistory::integrate_remote_changesets(file_ident_type remote_file_iden
         auto apply = [&](const Changeset* c) -> bool {
             TempShortCircuitReplication tdr{*this}; // Short-circuit while integrating changes
             InstructionApplier applier{transaction};
-            applier.apply(*c, &logger);
+            applier.apply(*c);
             reset(); // Reset the instruction encoder
             return true;
         };
         // Merge with causally unrelated changesets, and resolve the
         // conflicts if there are any.
         TransformHistoryImpl transform_hist{remote_file_ident, *this, recip_hist};
-        Transformer& transformer = m_context.get_transformer(); // Throws
+        Transformer transformer;
         transformer.transform_remote_changesets(transform_hist, m_local_file_ident, current_server_version,
-                                                parsed_transformed_changesets, std::move(apply),
-                                                logger); // Throws
+                                                parsed_transformed_changesets, apply, logger); // Throws
 
         for (std::size_t i = 0; i < num_changesets; ++i) {
             REALM_ASSERT(get_instruction_encoder().buffer().size() == 0);
@@ -1331,8 +1330,8 @@ _impl::History* ServerHistory::_get_history_write()
 // Overriding member in Replication
 std::unique_ptr<_impl::History> ServerHistory::_create_history_read()
 {
-    auto server_hist = std::make_unique<ServerHistory>(m_context);                     // Throws
-    server_hist->initialize(*m_db);                                                    // Throws
+    auto server_hist = std::make_unique<ServerHistory>(m_context); // Throws
+    server_hist->initialize(*m_db);                                // Throws
     return std::unique_ptr<_impl::History>(server_hist.release());
 }
 
@@ -2133,7 +2132,6 @@ void ServerHistory::fixup_state_and_changesets_for_assigned_file_ident(Transacti
     };
 
     auto get_table_for_class = [&](StringData class_name) -> ConstTableRef {
-        REALM_ASSERT(class_name.size() < Group::max_table_name_length - 6);
         Group::TableNameBuffer buffer;
         return group.get_table(Group::class_name_to_table_name(class_name, buffer));
     };
@@ -2244,18 +2242,6 @@ void ServerHistory::record_current_schema_version(Array& schema_versions, versio
         std::time_t timestamp = std::time(nullptr);
         sv_timestamps.add(std::int_fast64_t(timestamp)); // Throws
     }
-}
-
-
-Transformer& ServerHistory::Context::get_transformer()
-{
-    throw util::runtime_error("Not supported");
-}
-
-
-util::Buffer<char>& ServerHistory::Context::get_transform_buffer()
-{
-    throw util::runtime_error("Not supported");
 }
 
 

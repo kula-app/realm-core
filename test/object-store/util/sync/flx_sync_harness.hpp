@@ -49,10 +49,10 @@ public:
         return ServerSchema{std::move(schema), {"queryable_str_field", "queryable_int_field"}};
     }
 
-    static AppSession make_app_from_server_schema(const std::string& test_name,
-                                                  const FLXSyncTestHarness::ServerSchema& server_schema)
+    static AppCreateConfig make_config_from_server_schema(const std::string& test_name,
+                                                          const FLXSyncTestHarness::ServerSchema& server_schema)
     {
-        auto server_app_config = minimal_app_config(get_base_url(), test_name, server_schema.schema);
+        auto server_app_config = minimal_app_config(test_name, server_schema.schema);
         server_app_config.dev_mode_enabled = server_schema.dev_mode_enabled;
         AppCreateConfig::FLXSyncConfig flx_config;
         flx_config.queryable_fields = server_schema.queryable_fields;
@@ -60,7 +60,13 @@ public:
         server_app_config.flx_sync_config = std::move(flx_config);
         server_app_config.service_roles = server_schema.service_roles;
 
-        return create_app(server_app_config);
+        return server_app_config;
+    }
+
+    static AppSession make_app_from_server_schema(const std::string& test_name,
+                                                  const FLXSyncTestHarness::ServerSchema& server_schema)
+    {
+        return create_app(make_config_from_server_schema(test_name, server_schema));
     }
 
     struct Config {
@@ -115,17 +121,7 @@ public:
     {
         SyncTestFile config(m_test_session.app()->current_user(), schema(), SyncConfig::FLXSyncEnabled{});
         auto realm = Realm::get_shared_realm(config);
-        auto mut_subs = realm->get_latest_subscription_set().make_mutable_copy();
-        for (const auto& table : realm->schema()) {
-            if (table.table_type != ObjectSchema::ObjectType::TopLevel) {
-                continue;
-            }
-            Query query_for_table(realm->read_group().get_table(table.table_key));
-            mut_subs.insert_or_assign(query_for_table);
-        }
-        auto subs = std::move(mut_subs).commit();
-        subs.get_state_change_notification(sync::SubscriptionSet::State::Complete).get();
-        wait_for_download(*realm);
+        subscribe_to_all_and_bootstrap(*realm);
 
         realm->begin_transaction();
         func(realm);

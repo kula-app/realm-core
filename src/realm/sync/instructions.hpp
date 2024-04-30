@@ -84,14 +84,14 @@ using PrimaryKey = mpark::variant<mpark::monostate, int64_t, GlobalKey, InternSt
 struct Path {
     using Element = mpark::variant<InternString, uint32_t>;
 
-    // FIXME: Use a "small_vector" type for this -- most paths are very short.
-    // Alternatively, we could use some kind of interning with copy-on-write,
-    // but that seems complicated.
-    std::vector<Element> m_path;
-
     size_t size() const noexcept
     {
         return m_path.size();
+    }
+
+    void reserve(size_t sz)
+    {
+        m_path.reserve(sz);
     }
 
     // If this path is referring to an element of an array (the last path
@@ -142,6 +142,11 @@ struct Path {
         m_path.push_back(element);
     }
 
+    void clear()
+    {
+        m_path.clear();
+    }
+
     friend bool operator==(const Path& lhs, const Path& rhs) noexcept
     {
         return lhs.m_path == rhs.m_path;
@@ -156,18 +161,25 @@ struct Path {
     {
         return m_path.end();
     }
+
+private:
+    // FIXME: Use a "small_vector" type for this -- most paths are very short.
+    // Alternatively, we could use some kind of interning with copy-on-write,
+    // but that seems complicated.
+    std::vector<Element> m_path;
 };
 
 struct Payload {
     /// Create a new object in-place (embedded object).
-    struct ObjectValue {
-    };
+    struct ObjectValue {};
+    /// Create an empty list in-place (does not clear an existing list).
+    struct List {};
     /// Create an empty dictionary in-place (does not clear an existing dictionary).
-    struct Dictionary {
-    };
+    struct Dictionary {};
+    /// Create an empty set in-place (does not clear an existing set).
+    struct Set {};
     /// Sentinel value for an erased dictionary element.
-    struct Erased {
-    };
+    struct Erased {};
 
     /// Payload data types, corresponding loosely to the `DataType` enum in
     /// Core, but with some special values:
@@ -177,7 +189,7 @@ struct Payload {
     /// - ObjectValue (-2) indicates the creation of an embedded object.
     /// - Dictionary (-3) indicates the creation of a dictionary.
     /// - Erased (-4) indicates that a dictionary element should be erased.
-    /// - Undefined (-5) indicates the
+    /// - List (-5) indicates the creation of a list
     ///
     /// Furthermore, link values for both Link and LinkList columns are
     /// represented by a single Link type.
@@ -185,6 +197,12 @@ struct Payload {
     /// Note: For Mixed columns (including typed links), no separate value is required, because the
     /// instruction set encodes the type of each value in the instruction.
     enum class Type : int8_t {
+        // Special value indicating that a set should be created at the position.
+        Set = -6,
+
+        // Special value indicating that a list should be created at the position.
+        List = -5,
+
         // Special value indicating that a dictionary element should be erased.
         Erased = -4,
 
@@ -295,6 +313,18 @@ struct Payload {
         : type(Type::Erased)
     {
     }
+    Payload(const Dictionary&) noexcept
+        : type(Type::Dictionary)
+    {
+    }
+    Payload(const List&) noexcept
+        : type(Type::List)
+    {
+    }
+    Payload(const Set&) noexcept
+        : type(Type::Set)
+    {
+    }
 
     explicit Payload(Timestamp value) noexcept
         : type(value.is_null() ? Type::Null : Type::Timestamp)
@@ -343,16 +373,15 @@ struct Payload {
     {
         if (lhs.type == rhs.type) {
             switch (lhs.type) {
+                case Type::Null:
                 case Type::Erased:
-                    return true;
+                case Type::List:
+                case Type::Set:
                 case Type::Dictionary:
-                    return true;
                 case Type::ObjectValue:
                     return true;
                 case Type::GlobalKey:
                     return lhs.data.key == rhs.data.key;
-                case Type::Null:
-                    return true;
                 case Type::Int:
                     return lhs.data.integer == rhs.data.integer;
                 case Type::Bool:
@@ -385,6 +414,10 @@ struct Payload {
         return !(lhs == rhs);
     }
 };
+
+// This is backwards compatible with previous boolean type where 0
+// indicated simple type and 1 indicated list.
+enum class CollectionType : uint8_t { Single, List, Dictionary, Set };
 
 /// All instructions are TableInstructions.
 struct TableInstruction {
@@ -472,10 +505,6 @@ struct EraseTable : TableInstruction {
 
 struct AddColumn : TableInstruction {
     using TableInstruction::TableInstruction;
-
-    // This is backwards compatible with previous boolean type where 0
-    // indicated simple type and 1 indicated list.
-    enum class CollectionType : uint8_t { Single, List, Dictionary, Set };
 
     InternString field;
 
@@ -603,6 +632,7 @@ struct ArrayErase : PathInstruction {
 
 struct Clear : PathInstruction {
     using PathInstruction::PathInstruction;
+    CollectionType collection_type;
 
     bool operator==(const Clear& rhs) const noexcept
     {
@@ -645,6 +675,7 @@ struct Instruction {
     using Payload = instr::Payload;
     using Path = instr::Path;
     using Vector = std::vector<Instruction>;
+    using CollectionType = instr::CollectionType;
 
     // CAUTION: Any change to the enum values for the instruction types is a protocol-breaking
     // change!
@@ -734,8 +765,8 @@ struct Instruction {
     const Instruction& at(size_t) const noexcept;
 
 private:
-    template <class>
-    struct Visitor;
+    template <class V, class F>
+    static decltype(auto) visit(F&& lambda, V&& instr);
 };
 
 inline const char* get_type_name(Instruction::Type type)
@@ -761,6 +792,10 @@ inline const char* get_type_name(Instruction::Payload::Type type)
     switch (type) {
         case Type::Erased:
             return "Erased";
+        case Type::Set:
+            return "Set";
+        case Type::List:
+            return "List";
         case Type::Dictionary:
             return "Dictionary";
         case Type::ObjectValue:
@@ -795,9 +830,9 @@ inline const char* get_type_name(Instruction::Payload::Type type)
     return "(unknown)";
 }
 
-inline const char* get_collection_type(Instruction::AddColumn::CollectionType type)
+inline const char* get_collection_type(Instruction::CollectionType type)
 {
-    using Type = Instruction::AddColumn::CollectionType;
+    using Type = Instruction::CollectionType;
     switch (type) {
         case Type::Single:
             return "Single";
@@ -879,6 +914,10 @@ inline DataType get_data_type(Instruction::Payload::Type type) noexcept
             [[fallthrough]];
         case Type::Dictionary:
             [[fallthrough]];
+        case Type::List:
+            [[fallthrough]];
+        case Type::Set:
+            [[fallthrough]];
         case Type::ObjectValue:
             [[fallthrough]];
         case Type::GlobalKey:
@@ -934,47 +973,17 @@ Instruction::Instruction(T instr)
     static_assert(!std::is_same_v<T, Vector>);
 }
 
-template <class F>
-struct Instruction::Visitor {
-    F lambda; // reference type
-    Visitor(F lambda)
-        : lambda(lambda)
-    {
-    }
-
-    template <class T>
-    decltype(auto) operator()(T& instr)
-    {
-        return lambda(instr);
-    }
-
-    template <class T>
-    decltype(auto) operator()(const T& instr)
-    {
-        return lambda(instr);
-    }
-
-    auto operator()(const Instruction::Vector&) -> decltype(lambda(std::declval<const Instruction::Update&>()))
-    {
-        REALM_TERMINATE("visiting instruction vector");
-    }
-    auto operator()(Instruction::Vector&) -> decltype(lambda(std::declval<Instruction::Update&>()))
-    {
-        REALM_TERMINATE("visiting instruction vector");
-    }
-};
-
-template <class F>
-inline decltype(auto) Instruction::visit(F&& lambda)
+template <class V, class F>
+inline decltype(auto) Instruction::visit(F&& lambda, V&& instr)
 {
     // Cannot use std::visit, because it does not pass lvalue references to the visitor.
-    if (mpark::holds_alternative<Vector>(m_instr)) {
+    if (mpark::holds_alternative<Vector>(instr)) {
         REALM_TERMINATE("visiting instruction vector");
     }
 #define REALM_VISIT_VARIANT(X)                                                                                       \
-    else if (mpark::holds_alternative<Instruction::X>(m_instr))                                                      \
+    else if (auto ptr = mpark::get_if<Instruction::X>(&instr))                                                       \
     {                                                                                                                \
-        return lambda(mpark::get<Instruction::X>(m_instr));                                                          \
+        return lambda(*ptr);                                                                                         \
     }
     REALM_FOR_EACH_INSTRUCTION_TYPE(REALM_VISIT_VARIANT)
 #undef REALM_VISIT_VARIANT
@@ -985,23 +994,15 @@ inline decltype(auto) Instruction::visit(F&& lambda)
 }
 
 template <class F>
+inline decltype(auto) Instruction::visit(F&& lambda)
+{
+    return visit(std::forward<F>(lambda), m_instr);
+}
+
+template <class F>
 inline decltype(auto) Instruction::visit(F&& lambda) const
 {
-    // Cannot use std::visit, because it does not pass lvalue references to the visitor.
-    if (mpark::holds_alternative<Vector>(m_instr)) {
-        REALM_TERMINATE("visiting instruction vector");
-    }
-#define REALM_VISIT_VARIANT(X)                                                                                       \
-    else if (mpark::holds_alternative<Instruction::X>(m_instr))                                                      \
-    {                                                                                                                \
-        return lambda(mpark::get<Instruction::X>(m_instr));                                                          \
-    }
-    REALM_FOR_EACH_INSTRUCTION_TYPE(REALM_VISIT_VARIANT)
-#undef REALM_VISIT_VARIANT
-    else
-    {
-        REALM_TERMINATE("Unhandled instruction variant entry");
-    }
+    return visit(std::forward<F>(lambda), m_instr);
 }
 
 inline Instruction::Type Instruction::type() const noexcept

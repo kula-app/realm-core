@@ -122,9 +122,7 @@ TEST_CASE("sync: large reset with recovery is restartable", "[sync][pbs][client 
          }},
     };
 
-    std::string base_url = get_base_url();
-    REQUIRE(!base_url.empty());
-    auto server_app_config = minimal_app_config(base_url, "client_reset_tests", schema);
+    auto server_app_config = minimal_app_config("client_reset_tests", schema);
     server_app_config.partition_key = partition_prop;
     TestAppSession test_app_session(create_app(server_app_config));
     auto app = test_app_session.app();
@@ -185,7 +183,7 @@ TEST_CASE("sync: large reset with recovery is restartable", "[sync][pbs][client 
 
     realm->sync_session()->resume();
     timed_wait_for([&] {
-        return util::File::exists(_impl::ClientResetOperation::get_fresh_path_for(realm_config.path));
+        return util::File::exists(_impl::client_reset::get_fresh_path_for(realm_config.path));
     });
     realm->sync_session()->pause();
     realm->sync_session()->resume();
@@ -217,9 +215,7 @@ TEST_CASE("sync: pending client resets are cleared when downloads are complete",
          }},
     };
 
-    std::string base_url = get_base_url();
-    REQUIRE(!base_url.empty());
-    auto server_app_config = minimal_app_config(base_url, "client_reset_tests", schema);
+    auto server_app_config = minimal_app_config("client_reset_tests", schema);
     server_app_config.partition_key = partition_prop;
     TestAppSession test_app_session(create_app(server_app_config));
     auto app = test_app_session.app();
@@ -293,9 +289,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
              partition_prop,
          }},
     };
-    std::string base_url = get_base_url();
-    REQUIRE(!base_url.empty());
-    auto server_app_config = minimal_app_config(base_url, "client_reset_tests", schema);
+    auto server_app_config = minimal_app_config("client_reset_tests", schema);
     server_app_config.partition_key = partition_prop;
     TestAppSession test_app_session(create_app(server_app_config));
     auto app = test_app_session.app();
@@ -332,7 +326,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
             recovery_path = recovery_path_it->second;
             REQUIRE(util::File::exists(orig_path));
             REQUIRE(!util::File::exists(recovery_path));
-            bool did_reset_files = test_app_session.app()->sync_manager()->immediately_run_file_actions(orig_path);
+            bool did_reset_files = test_app_session.app()->immediately_run_file_actions(orig_path);
             REQUIRE(did_reset_files);
             REQUIRE(!util::File::exists(orig_path));
             REQUIRE(util::File::exists(recovery_path));
@@ -371,7 +365,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
 
     local_config.cache = false;
     local_config.automatic_change_notifications = false;
-    const std::string fresh_path = realm::_impl::ClientResetOperation::get_fresh_path_for(local_config.path);
+    const std::string fresh_path = realm::_impl::client_reset::get_fresh_path_for(local_config.path);
     size_t before_callback_invocations = 0;
     size_t after_callback_invocations = 0;
     std::mutex mtx;
@@ -400,6 +394,16 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
         REQUIRE(after->read_group().get_table("class_object"));
         REQUIRE(after->config().path == local_config.path);
         REQUIRE(after->current_transaction_version() > before->current_transaction_version());
+    };
+    auto get_key_for_object_with_value = [&](TableRef table, int64_t value) -> ObjKey {
+        REQUIRE(table);
+        auto target = std::find_if(table->begin(), table->end(), [&](auto& it) -> bool {
+            return it.template get<Int>("value") == value;
+        });
+        if (target == table->end()) {
+            return {};
+        }
+        return target->get_key();
     };
 
     Results results;
@@ -604,6 +608,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                 }
             };
             make_reset(local_config, remote_config)
+                ->set_development_mode(true)
                 ->setup([&](SharedRealm before) {
                     before->update_schema(
                         {
@@ -613,7 +618,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                                  partition_prop,
                              }},
                         },
-                        0, nullptr, nullptr, true);
+                        1, nullptr, nullptr, true);
                 })
                 ->make_local_changes([&](SharedRealm local) {
                     local->update_schema(
@@ -641,7 +646,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                                  remotely_added_property,
                              }},
                         },
-                        0, nullptr, nullptr, true);
+                        1, nullptr, nullptr, true);
 
                     create_object(*local, new_table_name, {pk1}, partition);
                     create_object(*local, existing_table_name, {pk1}, partition);
@@ -703,6 +708,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                 err = error;
             };
             make_reset(local_config, remote_config)
+                ->set_development_mode(true)
                 ->make_local_changes([&](SharedRealm local) {
                     local->update_schema(
                         {
@@ -713,7 +719,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                                  {prop_name, PropertyType::Float},
                              }},
                         },
-                        0, nullptr, nullptr, true);
+                        1, nullptr, nullptr, true);
                 })
                 ->make_remote_changes([&](SharedRealm remote) {
                     remote->update_schema(
@@ -738,6 +744,59 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
             REQUIRE(err.value()->is_client_reset_requested());
             REQUIRE(before_callback_invocations == 1);
             REQUIRE(after_callback_invocations == 0);
+        }
+
+        SECTION("add remotely deleted object to list") {
+            test_reset
+                ->setup([&](SharedRealm realm) {
+                    ObjKey k1 =
+                        create_object(*realm, "link target", ObjectId::gen(), partition).set("value", 1).get_key();
+                    ObjKey k2 =
+                        create_object(*realm, "link target", ObjectId::gen(), partition).set("value", 2).get_key();
+                    ObjKey k3 =
+                        create_object(*realm, "link target", ObjectId::gen(), partition).set("value", 3).get_key();
+                    Obj o = create_object(*realm, "link origin", ObjectId::gen(), partition);
+                    auto list = o.get_linklist("list");
+                    list.add(k1);
+                    list.add(k2);
+                    list.add(k3);
+                    // 1, 2, 3
+                })
+                ->make_local_changes([&](SharedRealm local) {
+                    auto key1 = get_key_for_object_with_value(get_table(*local, "link target"), 1);
+                    auto key2 = get_key_for_object_with_value(get_table(*local, "link target"), 2);
+                    auto key3 = get_key_for_object_with_value(get_table(*local, "link target"), 3);
+                    auto table = get_table(*local, "link origin");
+                    auto list = table->begin()->get_linklist("list");
+                    REQUIRE(list.size() == 3);
+                    list.insert(1, key2);
+                    list.add(key2);
+                    list.add(key3); // common suffix of key3
+                    // 1, 2, 2, 3, 2, 3
+                    // this set operation triggers the list copy because the index becomes ambiguious
+                    list.set(0, key1);
+                })
+                ->make_remote_changes([&](SharedRealm remote) {
+                    auto table = get_table(*remote, "link target");
+                    auto key = get_key_for_object_with_value(table, 2);
+                    REQUIRE(key);
+                    table->remove_object(key);
+                })
+                ->on_post_reset([&](SharedRealm realm) {
+                    REQUIRE_NOTHROW(realm->refresh());
+                    auto table = get_table(*realm, "link origin");
+                    auto target_table = get_table(*realm, "link target");
+                    REQUIRE(table->size() == 1);
+                    REQUIRE(target_table->size() == 2);
+                    REQUIRE(get_key_for_object_with_value(target_table, 1));
+                    REQUIRE(get_key_for_object_with_value(target_table, 3));
+                    auto list = table->begin()->get_linklist("list");
+                    REQUIRE(list.size() == 3); // 1, 3, 3
+                    REQUIRE(list.get_object(0).get<Int>("value") == 1);
+                    REQUIRE(list.get_object(1).get<Int>("value") == 3);
+                    REQUIRE(list.get_object(2).get<Int>("value") == 3);
+                })
+                ->run();
         }
     } // end recovery section
 
@@ -894,7 +953,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                 auto realm = Realm::get_shared_realm(temp_config);
                 wait_for_upload(*realm);
 
-                session = test_app_session.app()->sync_manager()->get_existing_session(temp_config.path);
+                session = test_app_session.sync_manager()->get_existing_session(temp_config.path);
                 REQUIRE(session);
             }
             sync::SessionErrorInfo synthetic(Status{ErrorCodes::SyncClientResetRequired, "A fake client reset error"},
@@ -946,7 +1005,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                     },
                     std::chrono::seconds(20));
             }
-            auto session = test_app_session.app()->sync_manager()->get_existing_session(local_config.path);
+            auto session = test_app_session.sync_manager()->get_existing_session(local_config.path);
             if (session) {
                 session->shutdown_and_wait();
             }
@@ -968,7 +1027,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                 ->run();
 
             timed_wait_for([&] {
-                return util::File::exists(_impl::ClientResetOperation::get_fresh_path_for(local_config.path));
+                return util::File::exists(_impl::client_reset::get_fresh_path_for(local_config.path));
             });
 
             // Restart the session before the client reset finishes.
@@ -996,7 +1055,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
             local_config.sync_config->error_handler = [&](std::shared_ptr<SyncSession>, SyncError error) {
                 err = error;
             };
-            std::string fresh_path = realm::_impl::ClientResetOperation::get_fresh_path_for(local_config.path);
+            std::string fresh_path = realm::_impl::client_reset::get_fresh_path_for(local_config.path);
             util::File f(fresh_path, util::File::Mode::mode_Write);
             f.write("a non empty file");
             f.sync();
@@ -1013,7 +1072,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
             local_config.sync_config->error_handler = [&](std::shared_ptr<SyncSession>, SyncError error) {
                 err = error;
             };
-            std::string fresh_path = realm::_impl::ClientResetOperation::get_fresh_path_for(local_config.path);
+            std::string fresh_path = realm::_impl::client_reset::get_fresh_path_for(local_config.path);
             // create a non-empty directory that we'll fail to delete
             util::make_dir(fresh_path);
             util::File(util::File::resolve("file", fresh_path), util::File::mode_Write);
@@ -1180,6 +1239,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                 err = error;
             };
             make_reset(local_config, remote_config)
+                ->set_development_mode(true)
                 ->make_local_changes([&](SharedRealm local) {
                     local->update_schema(
                         {
@@ -1189,7 +1249,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                                  {"realm_id", PropertyType::String | PropertyType::Nullable},
                              }},
                         },
-                        0, nullptr, nullptr, true);
+                        1, nullptr, nullptr, true);
                     create_object(*local, "object2", ObjectId::gen(), partition);
                     create_object(*local, "object2", ObjectId::gen(), partition);
                 })
@@ -1212,6 +1272,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                 err = error;
             };
             make_reset(local_config, remote_config)
+                ->set_development_mode(true)
                 ->make_local_changes([](SharedRealm local) {
                     local->update_schema(
                         {
@@ -1224,7 +1285,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                                  {"realm_id", PropertyType::String | PropertyType::Nullable},
                              }},
                         },
-                        0, nullptr, nullptr, true);
+                        1, nullptr, nullptr, true);
                     auto table = ObjectStore::table_for_object_type(local->read_group(), "object");
                     table->begin()->set(table->get_column_key("value2"), 123);
                 })
@@ -1243,7 +1304,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
         }
 
         SECTION("compatible schema changes in both remote and local transactions") {
-            test_reset
+            test_reset->set_development_mode(true)
                 ->make_local_changes([](SharedRealm local) {
                     local->update_schema(
                         {
@@ -1260,7 +1321,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                                  {"realm_id", PropertyType::String | PropertyType::Nullable},
                              }},
                         },
-                        0, nullptr, nullptr, true);
+                        1, nullptr, nullptr, true);
                 })
                 ->make_remote_changes([](SharedRealm remote) {
                     remote->update_schema(
@@ -1295,6 +1356,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                 err = error;
             };
             make_reset(local_config, remote_config)
+                ->set_development_mode(true)
                 ->make_local_changes([](SharedRealm local) {
                     local->update_schema(
                         {
@@ -1305,7 +1367,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                                  {"realm_id", PropertyType::String | PropertyType::Nullable},
                              }},
                         },
-                        0, nullptr, nullptr, true);
+                        1, nullptr, nullptr, true);
                 })
                 ->make_remote_changes([](SharedRealm remote) {
                     remote->update_schema(
@@ -1337,6 +1399,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
             };
 
             make_reset(local_config, remote_config)
+                ->set_development_mode(true)
                 ->make_local_changes([](SharedRealm local) {
                     local->update_schema(
                         {
@@ -1346,7 +1409,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                                  {"realm_id", PropertyType::String | PropertyType::Nullable},
                              }},
                         },
-                        0, nullptr, nullptr, true);
+                        1, nullptr, nullptr, true);
                 })
                 ->make_remote_changes([](SharedRealm remote) {
                     remote->update_schema(
@@ -1484,17 +1547,6 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                 ->run();
         }
 
-        auto get_key_for_object_with_value = [&](TableRef table, int64_t value) -> ObjKey {
-            REQUIRE(table);
-            auto target = std::find_if(table->begin(), table->end(), [&](auto& it) -> bool {
-                return it.template get<Int>("value") == value;
-            });
-            if (target == table->end()) {
-                return {};
-            }
-            return target->get_key();
-        };
-
         SECTION("link to remotely deleted object") {
             test_reset
                 ->setup([&](SharedRealm realm) {
@@ -1575,7 +1627,7 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
         auto has_reset_cycle_flag = [](SharedRealm realm) -> util::Optional<_impl::client_reset::PendingReset> {
             auto db = TestHelper::get_db(realm);
             auto rt = db->start_read();
-            return _impl::client_reset::has_pending_reset(rt);
+            return _impl::client_reset::has_pending_reset(*rt);
         };
         ThreadSafeSyncError err;
         local_config.sync_config->error_handler = [&](std::shared_ptr<SyncSession>, SyncError error) {
@@ -1585,16 +1637,15 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
             local_config.sync_config->notify_before_client_reset = [previous_type = type](SharedRealm realm) {
                 auto db = TestHelper::get_db(realm);
                 auto wt = db->start_write();
-                _impl::client_reset::track_reset(wt, previous_type);
+                _impl::client_reset::track_reset(*wt, previous_type);
                 wt->commit();
             };
         };
         SECTION("a normal reset adds and removes a cycle detection flag") {
             local_config.sync_config->client_resync_mode = ClientResyncMode::RecoverOrDiscard;
             local_config.sync_config->notify_before_client_reset = [&](SharedRealm realm) {
-                auto flag = has_reset_cycle_flag(realm);
-                REQUIRE(!flag);
-                std::lock_guard<std::mutex> lock(mtx);
+                REQUIRE_FALSE(has_reset_cycle_flag(realm));
+                std::lock_guard lock(mtx);
                 ++before_callback_invocations;
             };
             local_config.sync_config->notify_after_client_reset = [&](SharedRealm, ThreadSafeReference realm_ref,
@@ -1604,19 +1655,35 @@ TEST_CASE("sync: client reset", "[sync][pbs][client reset][baas]") {
                 REQUIRE(bool(flag));
                 REQUIRE(flag->type == ClientResyncMode::Recover);
                 REQUIRE(did_recover);
-                std::lock_guard<std::mutex> lock(mtx);
+                std::lock_guard lock(mtx);
                 ++after_callback_invocations;
             };
             make_reset(local_config, remote_config)
                 ->on_post_local_changes([&](SharedRealm realm) {
-                    auto flag = has_reset_cycle_flag(realm);
-                    REQUIRE(!flag);
+                    REQUIRE_FALSE(has_reset_cycle_flag(realm));
                 })
                 ->run();
             REQUIRE(!err);
             REQUIRE(before_callback_invocations == 1);
             REQUIRE(after_callback_invocations == 1);
         }
+
+        SECTION("a failed reset leaves a cycle detection flag") {
+            local_config.sync_config->client_resync_mode = ClientResyncMode::Recover;
+            make_reset(local_config, remote_config)
+                ->make_local_changes([](SharedRealm realm) {
+                    auto table = realm->read_group().get_table("class_object");
+                    table->remove_column(table->add_column(type_Int, "new col"));
+                })
+                ->run();
+            local_config.sync_config.reset();
+            local_config.force_sync_history = true;
+            auto realm = Realm::get_shared_realm(local_config);
+            auto flag = has_reset_cycle_flag(realm);
+            REQUIRE(flag);
+            CHECK(flag->type == ClientResyncMode::Recover);
+        }
+
         SECTION("In DiscardLocal mode: a previous failed discard reset is detected and generates an error") {
             local_config.sync_config->client_resync_mode = ClientResyncMode::DiscardLocal;
             make_fake_previous_reset(ClientResyncMode::DiscardLocal);
@@ -1794,80 +1861,69 @@ TEST_CASE("sync: Client reset during async open", "[sync][pbs][client reset][baa
          }},
     };
 
-    std::string base_url = get_base_url();
-    REQUIRE(!base_url.empty());
-    auto server_app_config = minimal_app_config(base_url, "client_reset_tests", schema);
+    auto server_app_config = minimal_app_config("client_reset_tests", schema);
     server_app_config.partition_key = partition_prop;
     TestAppSession test_app_session(create_app(server_app_config));
     auto app = test_app_session.app();
 
-    auto before_callback_called = util::make_promise_future<void>();
-    auto after_callback_called = util::make_promise_future<void>();
     create_user_and_log_in(app);
     SyncTestFile realm_config(app->current_user(), partition.value, std::nullopt,
                               [](std::shared_ptr<SyncSession>, SyncError) { /*noop*/ });
     realm_config.sync_config->client_resync_mode = ClientResyncMode::Recover;
 
-    realm_config.sync_config->on_sync_client_event_hook =
-        [&, client_reset_triggered = false](std::weak_ptr<SyncSession> weak_sess,
-                                            const SyncClientHookData& event_data) mutable {
-            auto sess = weak_sess.lock();
-            if (!sess) {
-                return SyncClientHookAction::NoAction;
-            }
-            if (sess->path() != realm_config.path) {
-                return SyncClientHookAction::NoAction;
-            }
+    bool client_reset_triggered = false;
+    realm_config.sync_config->on_sync_client_event_hook = [&](std::weak_ptr<SyncSession> weak_sess,
+                                                              const SyncClientHookData& event_data) mutable {
+        auto sess = weak_sess.lock();
+        if (!sess) {
+            return SyncClientHookAction::NoAction;
+        }
+        if (sess->path() != realm_config.path) {
+            return SyncClientHookAction::NoAction;
+        }
 
-            if (event_data.event != SyncClientHookEvent::DownloadMessageReceived) {
-                return SyncClientHookAction::NoAction;
-            }
+        if (event_data.event != SyncClientHookEvent::DownloadMessageReceived) {
+            return SyncClientHookAction::NoAction;
+        }
 
-            if (client_reset_triggered) {
-                return SyncClientHookAction::NoAction;
-            }
-            client_reset_triggered = true;
-            reset_utils::trigger_client_reset(test_app_session.app_session());
-            return SyncClientHookAction::EarlyReturn;
-        };
+        if (client_reset_triggered) {
+            return SyncClientHookAction::NoAction;
+        }
+        client_reset_triggered = true;
+        reset_utils::trigger_client_reset(test_app_session.app_session(), *sess);
+        return SyncClientHookAction::SuspendWithRetryableError;
+    };
 
     // Expected behaviour is that the frozen realm passed in the callback should have no
     // schema initialized if a client reset happens during an async open and the realm has never been opened before.
     // SDK's should handle any edge cases which require the use of a schema i.e
     // calling set_schema_subset(...)
-    realm_config.sync_config->notify_before_client_reset =
-        [promise = util::CopyablePromiseHolder(std::move(before_callback_called.promise))](
-            std::shared_ptr<Realm> realm) mutable {
-            CHECK(realm->schema_version() == ObjectStore::NotVersioned);
-            promise.get_promise().emplace_value();
-        };
+    auto before_callback_called = util::make_promise_future<void>();
+    realm_config.sync_config->notify_before_client_reset = [&](std::shared_ptr<Realm> realm) {
+        CHECK(realm->schema_version() == ObjectStore::NotVersioned);
+        before_callback_called.promise.emplace_value();
+    };
 
-    realm_config.sync_config->notify_after_client_reset =
-        [promise = util::CopyablePromiseHolder(std::move(after_callback_called.promise))](
-            std::shared_ptr<Realm> realm, ThreadSafeReference, bool) mutable {
-            CHECK(realm->schema_version() == ObjectStore::NotVersioned);
-            promise.get_promise().emplace_value();
-        };
+    auto after_callback_called = util::make_promise_future<void>();
+    realm_config.sync_config->notify_after_client_reset = [&](std::shared_ptr<Realm> realm, ThreadSafeReference,
+                                                              bool) {
+        CHECK(realm->schema_version() == ObjectStore::NotVersioned);
+        after_callback_called.promise.emplace_value();
+    };
 
     auto realm_task = Realm::get_synchronized_realm(realm_config);
     auto realm_pf = util::make_promise_future<SharedRealm>();
-    realm_task->start([promise_holder = util::CopyablePromiseHolder(std::move(realm_pf.promise))](
-                          ThreadSafeReference ref, std::exception_ptr ex) mutable {
-        auto promise = promise_holder.get_promise();
-        if (ex) {
-            try {
+    realm_task->start([&](ThreadSafeReference ref, std::exception_ptr ex) {
+        try {
+            if (ex) {
                 std::rethrow_exception(ex);
             }
-            catch (...) {
-                promise.set_error(exception_to_status());
-            }
-            return;
+            auto realm = Realm::get_shared_realm(std::move(ref));
+            realm_pf.promise.emplace_value(std::move(realm));
         }
-        auto realm = Realm::get_shared_realm(std::move(ref));
-        if (!realm) {
-            promise.set_error({ErrorCodes::RuntimeError, "could not get realm from threadsaferef"});
+        catch (...) {
+            realm_pf.promise.set_error(exception_to_status());
         }
-        promise.emplace_value(std::move(realm));
     });
     auto realm = realm_pf.future.get();
     before_callback_called.future.get();
@@ -1890,9 +1946,8 @@ TEMPLATE_TEST_CASE("client reset types", "[sync][pbs][client reset]", cf::MixedV
     if (!util::EventLoop::has_implementation())
         return;
 
-    TestSyncManager init_sync_manager;
-    SyncTestFile config(init_sync_manager.app(), "default");
-    config.cache = false;
+    OfflineAppSession oas;
+    SyncTestFile config(oas, "default");
     config.automatic_change_notifications = false;
     ClientResyncMode test_mode = GENERATE(ClientResyncMode::DiscardLocal, ClientResyncMode::Recover);
     CAPTURE(test_mode);
@@ -1911,7 +1966,7 @@ TEMPLATE_TEST_CASE("client reset types", "[sync][pbs][client reset]", cf::MixedV
           {"set", PropertyType::Set | TestType::property_type}}},
     };
 
-    SyncTestFile config2(init_sync_manager.app(), "default");
+    SyncTestFile config2(oas.app()->current_user(), "default");
     config2.schema = config.schema;
 
     Results results;
@@ -2441,6 +2496,16 @@ struct Move {
     size_t to;
 };
 
+struct Insert {
+    Insert(size_t index, util::Optional<int64_t> key)
+        : ndx(index)
+        , pk(key)
+    {
+    }
+    size_t ndx;
+    util::Optional<int64_t> pk;
+};
+
 struct CollectionOperation {
     CollectionOperation(Add op)
         : m_op(op)
@@ -2466,8 +2531,19 @@ struct CollectionOperation {
         : m_op(op)
     {
     }
+    CollectionOperation(Insert op)
+        : m_op(op)
+    {
+    }
     void apply(collection_fixtures::LinkedCollectionBase* collection, Obj src_obj, TableRef dst_table)
     {
+        auto get_table = [&](std::string_view name) -> TableRef {
+            Group* group = dst_table->get_parent_group();
+            Group::TableNameBuffer buffer;
+            TableRef table = group->get_table(Group::class_name_to_table_name(name, buffer));
+            REALM_ASSERT(table);
+            return table;
+        };
         mpark::visit(
             util::overload{
                 [&](Add add_link) {
@@ -2484,25 +2560,23 @@ struct CollectionOperation {
                     REALM_ASSERT(did_remove);
                 },
                 [&](RemoveObject remove_object) {
-                    Group* group = dst_table->get_parent_group();
-                    Group::TableNameBuffer buffer;
-                    TableRef table =
-                        group->get_table(Group::class_name_to_table_name(remove_object.class_name, buffer));
-                    REALM_ASSERT(table);
+                    TableRef table = get_table(remove_object.class_name);
                     ObjKey dst_key = table->find_primary_key(Mixed{remove_object.pk});
                     REALM_ASSERT(dst_key);
                     table->remove_object(dst_key);
                 },
                 [&](CreateObject create_object) {
-                    Group* group = dst_table->get_parent_group();
-                    Group::TableNameBuffer buffer;
-                    TableRef table =
-                        group->get_table(Group::class_name_to_table_name(create_object.class_name, buffer));
-                    REALM_ASSERT(table);
+                    TableRef table = get_table(create_object.class_name);
                     table->create_object_with_primary_key(Mixed{create_object.pk});
                 },
                 [&](Clear) {
                     collection->clear_collection(src_obj);
+                },
+                [&](Insert insert) {
+                    Mixed pk_to_add = insert.pk ? Mixed{insert.pk} : Mixed{};
+                    ObjKey dst_key = dst_table->find_primary_key(pk_to_add);
+                    REALM_ASSERT(dst_key);
+                    collection->insert(src_obj, insert.ndx, ObjLink{dst_table->get_key(), dst_key});
                 },
                 [&](Move move) {
                     collection->move(src_obj, move.from, move.to);
@@ -2511,7 +2585,7 @@ struct CollectionOperation {
     }
 
 private:
-    mpark::variant<Add, Remove, Clear, RemoveObject, CreateObject, Move> m_op;
+    mpark::variant<Add, Remove, Clear, RemoveObject, CreateObject, Move, Insert> m_op;
 };
 
 } // namespace test_instructions
@@ -2529,6 +2603,7 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[sync][pbs][client rese
     const std::string collection_prop_name = "collection";
     TestType test_type(collection_prop_name, "dest");
     constexpr bool test_type_is_array = realm::is_any_v<TestType, cf::ListOfObjects, cf::ListOfMixedLinks>;
+    constexpr bool test_type_is_set = realm::is_any_v<TestType, cf::SetOfObjects, cf::SetOfMixedLinks>;
     Schema schema = {
         {"source",
          {{valid_pk_name, PropertyType::Int | PropertyType::Nullable, true},
@@ -2547,16 +2622,15 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[sync][pbs][client rese
          }},
     };
 
-    TestSyncManager init_sync_manager;
-    SyncTestFile config(init_sync_manager.app(), "default");
-    config.cache = false;
+    OfflineAppSession oas;
+    SyncTestFile config(oas, "default");
     config.automatic_change_notifications = false;
     config.schema = schema;
     ClientResyncMode test_mode = GENERATE(ClientResyncMode::DiscardLocal, ClientResyncMode::Recover);
     CAPTURE(test_mode);
     config.sync_config->client_resync_mode = test_mode;
 
-    SyncTestFile config2(init_sync_manager.app(), "default");
+    SyncTestFile config2(oas.app()->current_user(), "default");
     config2.schema = schema;
 
     std::unique_ptr<reset_utils::TestClientReset> test_reset =
@@ -2682,8 +2756,10 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[sync][pbs][client rese
                     REQUIRE_NOTHROW(advance_and_notify(*realm));
                     CHECK(results.size() == 1);
                     CHECK(object.is_valid());
-                    auto linked_objects = test_type.get_links(results.get(0));
+                    Obj origin = results.get(0);
+                    auto linked_objects = test_type.get_links(origin);
                     std::vector<util::Optional<int64_t>>& expected_links = remote_pks;
+                    const size_t actual_size = test_type.size_of_collection(origin);
                     if (test_mode == ClientResyncMode::Recover) {
                         expected_links = expected_recovered_state;
                         size_t expected_size = expected_links.size();
@@ -2691,7 +2767,15 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[sync][pbs][client rese
                             // dictionary size will remain the same because the key is preserved with a null value
                             expected_size += num_expected_nulls;
                         }
-                        CHECK(test_type.size_of_collection(results.get(0)) == expected_size);
+                        CHECK(actual_size == expected_size);
+                        if (actual_size != expected_size) {
+                            std::vector<Obj> links = test_type.get_links(origin);
+                            std::cout << "actual {";
+                            for (auto link : links) {
+                                std::cout << link.get_primary_key() << ", ";
+                            }
+                            std::cout << "}\n";
+                        }
                     }
                     if (!test_type_is_array) {
                         // order should not matter except for lists
@@ -2699,13 +2783,13 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[sync][pbs][client rese
                         std::sort(expected_links.begin(), expected_links.end());
                     }
                     require_links_to_match_ids(linked_objects, expected_links, !test_type_is_array);
-                    if (local_pks == expected_links) {
-                        REQUIRE_INDICES(results_changes.modifications);
-                        REQUIRE_INDICES(object_changes.modifications);
-                    }
-                    else {
+                    if (local_pks != expected_links) {
                         REQUIRE_INDICES(results_changes.modifications, 0);
                         REQUIRE_INDICES(object_changes.modifications, 0);
+                    }
+                    else {
+                        REQUIRE_INDICES(results_changes.modifications);
+                        REQUIRE_INDICES(object_changes.modifications);
                     }
                     REQUIRE_INDICES(results_changes.insertions);
                     REQUIRE_INDICES(results_changes.deletions);
@@ -2731,8 +2815,7 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[sync][pbs][client rese
             })
             ->run();
     };
-
-    test_reset->setup([&](SharedRealm realm) {
+    auto populate_initial_state = [&](SharedRealm realm) {
         test_type.reset_test_state();
         // add a container collection with three valid links
         ObjLink dest1 = create_one_dest_object(realm, dest_pk_1);
@@ -2741,6 +2824,10 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[sync][pbs][client rese
         create_one_dest_object(realm, dest_pk_4);
         create_one_dest_object(realm, dest_pk_5);
         create_one_source_object(realm, source_pk, {dest1, dest2, dest3});
+    };
+
+    test_reset->setup([&](SharedRealm realm) {
+        populate_initial_state(realm);
     });
 
     SECTION("no changes") {
@@ -2854,6 +2941,59 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[sync][pbs][client rese
         reset_collection({RemoveObject{"dest", dest_pk_4}}, {Add{dest_pk_4}, Add{dest_pk_5}},
                          {dest_pk_1, dest_pk_2, dest_pk_3, dest_pk_5}, 1);
     }
+    SECTION("local adds two links to objects which are both removed by the remote") {
+        reset_collection({Add{dest_pk_4}, Add{dest_pk_5}, CreateObject("dest", 6), Add{6}},
+                         {RemoveObject("dest", dest_pk_4), RemoveObject("dest", dest_pk_5)},
+                         {dest_pk_1, dest_pk_2, dest_pk_3, 6}, 2);
+    }
+    SECTION("local removes two objects which were linked to by remote") {
+        reset_collection(
+            {RemoveObject("dest", dest_pk_1), RemoveObject("dest", dest_pk_2), CreateObject("dest", 6), Add{6}}, {},
+            {dest_pk_3, 6}, 2);
+    }
+    SECTION("local has unresolved links") {
+        test_reset->setup([&](SharedRealm realm) {
+            populate_initial_state(realm);
+
+            auto invalidate_object = [&](SharedRealm realm, std::string_view table_name, Mixed pk) {
+                TableRef table = get_table(*realm, table_name);
+                Obj obj = table->get_object_with_primary_key(pk);
+                REALM_ASSERT(obj.is_valid());
+                if (realm->config().path == config.path) {
+                    // the local realm does an invalidation
+                    table->invalidate_object(obj.get_key());
+                }
+                else {
+                    // the remote realm has deleted it
+                    table->remove_object(obj.get_key());
+                }
+            };
+
+            invalidate_object(realm, "dest", dest_pk_1);
+        });
+
+        SECTION("remote adds a link") {
+            reset_collection({}, {Add{dest_pk_4}}, {dest_pk_2, dest_pk_3, dest_pk_4}, 1);
+        }
+        SECTION("remote removes a link") {
+            reset_collection({}, {Remove{dest_pk_2}}, {dest_pk_3}, 1);
+        }
+        SECTION("remote deletes a dest object that local links to") {
+            reset_collection({Add{dest_pk_4}}, {RemoveObject{"dest", dest_pk_4}}, {dest_pk_2, dest_pk_3}, 2);
+        }
+        SECTION("remote deletes a different dest object") {
+            reset_collection({Add{dest_pk_4}}, {RemoveObject{"dest", dest_pk_2}}, {dest_pk_3, dest_pk_4}, 2);
+        }
+        SECTION("local adds two new links and remote deletes a different dest object") {
+            reset_collection({Add{dest_pk_4}, Add{dest_pk_5}}, {RemoveObject{"dest", dest_pk_2}},
+                             {dest_pk_3, dest_pk_4, dest_pk_5}, 2);
+        }
+        SECTION("remote deletes an object, then removes and adds to the list") {
+            reset_collection({}, {RemoveObject{"dest", dest_pk_2}, Remove{dest_pk_3}, Add{dest_pk_4}}, {dest_pk_4},
+                             2);
+        }
+    }
+
     if (test_mode == ClientResyncMode::Recover) {
         SECTION("local adds a list item and removes source object, remote modifies list") {
             reset_collection_removing_source_object({Add{dest_pk_4}, RemoveObject{"source", source_pk}},
@@ -2885,6 +3025,47 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[sync][pbs][client rese
             reset_collection({Move{0, 1}, Add{dest_pk_5}}, {Add{dest_pk_4}},
                              {dest_pk_2, dest_pk_1, dest_pk_3, dest_pk_5});
         }
+        SECTION("local moves on non-added elements with server dest obj removal") {
+            reset_collection(
+                {Move{0, 1}, Add{dest_pk_5}}, {Add{dest_pk_4}, RemoveObject("dest", dest_pk_1)},
+                {dest_pk_2, dest_pk_3,
+                 dest_pk_5}); // copy over local list, but without the dest_pk_1 link because that object was deleted
+        }
+        SECTION("local moves on non-added elements with all server dest objs removed") {
+            reset_collection({Move{0, 1}, Add{dest_pk_5}},
+                             {Add{dest_pk_4}, RemoveObject("dest", dest_pk_1), RemoveObject("dest", dest_pk_2),
+                              RemoveObject("dest", dest_pk_3), RemoveObject("dest", dest_pk_5)},
+                             {}); // copy over local list, but all links have been removed
+        }
+        SECTION("local moves on non-added elements when server creates a new object and adds it to the list") {
+            reset_collection({Move{0, 1}, Add{dest_pk_5}}, {CreateObject("dest", 6), Add{6}},
+                             {dest_pk_2, dest_pk_1, dest_pk_3, dest_pk_5});
+        }
+        SECTION("local moves on locally-added elements when server removes the object that the new links point to") {
+            reset_collection({Add{dest_pk_5}, Add{dest_pk_5}, Move{4, 3}},
+                             {Add{dest_pk_4}, RemoveObject("dest", dest_pk_5)},
+                             {dest_pk_1, dest_pk_2, dest_pk_3}); // local overwrite, but without pk_5
+        }
+        SECTION("local insert and delete can be recovered even if a local link was deleted by remote") {
+            // start  : 1, 2, 3
+            // local  : 1, 2, 3, 5, 6, 1
+            // remote : 4, 1, 2, 3 {remove obj 5}
+            // result : 1, 2, 3, 6, 1
+            reset_collection({CreateObject("dest", 6), Add{dest_pk_5}, Add{6}, Insert{4, dest_pk_4},
+                              Remove{dest_pk_4}, Add{dest_pk_1}},
+                             {Insert{0, dest_pk_4}, RemoveObject("dest", dest_pk_5)},
+                             {dest_pk_4, dest_pk_1, dest_pk_2, dest_pk_3, 6, dest_pk_1});
+        }
+        SECTION("both add link to object which has been deleted by other side") {
+            // start  : 1, 2, 3
+            // local  : 1, 1, 2, 3, 5, {remove object 4}
+            // remote : 1, 2, 3, 3, 4, {remove obj 5}
+            // result : 1, 1, 2, 3, 3
+            reset_collection({Add{dest_pk_5}, Insert{0, dest_pk_1}, RemoveObject("dest", dest_pk_4)},
+                             {Add{dest_pk_4}, Insert{3, dest_pk_3}, RemoveObject("dest", dest_pk_5)},
+                             {dest_pk_1, dest_pk_1, dest_pk_2, dest_pk_3, dest_pk_3});
+        }
+
         SECTION("local moves on added elements can be merged with remote moves") {
             reset_collection({Add{dest_pk_4}, Add{dest_pk_5}, Move{3, 4}}, {Move{0, 1}},
                              {dest_pk_2, dest_pk_1, dest_pk_3, dest_pk_5, dest_pk_4});
@@ -2908,6 +3089,15 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[sync][pbs][client rese
         SECTION("local move (down) with delete on added elements can be merged with remote deletions") {
             reset_collection({Add{dest_pk_4}, Add{dest_pk_5}, Move{4, 3}, Remove{dest_pk_5}},
                              {Remove{dest_pk_1}, Remove{dest_pk_2}}, {dest_pk_3, dest_pk_4});
+        }
+    }
+    else if constexpr (test_type_is_set) {
+        SECTION("remote adds two links to objects which are both removed by local") {
+            reset_collection({RemoveObject("dest", dest_pk_4), RemoveObject("dest", dest_pk_5),
+                              CreateObject("dest", 6), Add{6}, Remove{dest_pk_1}},
+                             {Remove{dest_pk_2}, Add{dest_pk_4}, Add{dest_pk_5}, CreateObject("dest", 6), Add{6},
+                              CreateObject("dest", 7), Add{7}, RemoveObject("dest", dest_pk_5)},
+                             {dest_pk_3, 6, 7});
         }
     }
 }
@@ -2948,9 +3138,8 @@ TEST_CASE("client reset with embedded object", "[sync][pbs][client reset][embedd
     if (!util::EventLoop::has_implementation())
         return;
 
-    TestSyncManager init_sync_manager;
-    SyncTestFile config(init_sync_manager.app(), "default");
-    config.cache = false;
+    OfflineAppSession oas;
+    SyncTestFile config(oas, "default");
     config.automatic_change_notifications = false;
     ClientResyncMode test_mode = GENERATE(ClientResyncMode::DiscardLocal, ClientResyncMode::Recover);
     CAPTURE(test_mode);
@@ -2971,6 +3160,7 @@ TEST_CASE("client reset with embedded object", "[sync][pbs][client reset][embedd
              {"embedded_obj", PropertyType::Object | PropertyType::Nullable, "EmbeddedObject"},
              {"embedded_dict", PropertyType::Object | PropertyType::Dictionary | PropertyType::Nullable,
               "EmbeddedObject"},
+             {"any_mixed", PropertyType::Mixed | PropertyType::Nullable},
          }},
         {"EmbeddedObject",
          ObjectSchema::ObjectType::Embedded,
@@ -3296,7 +3486,7 @@ TEST_CASE("client reset with embedded object", "[sync][pbs][client reset][embedd
         }
     };
 
-    SyncTestFile config2(init_sync_manager.app(), "default");
+    SyncTestFile config2(oas.app()->current_user(), "default");
     config2.schema = config.schema;
 
     std::unique_ptr<reset_utils::TestClientReset> test_reset =
@@ -3495,16 +3685,14 @@ TEST_CASE("client reset with embedded object", "[sync][pbs][client reset][embedd
             reset_embedded_object({local}, {remote}, expected_recovered);
         }
         SECTION("local ArraySet to an embedded object through a deep link->linklist element which is removed by the "
-                "remote "
-                "triggers a list copy") {
+                "remote triggers a list copy") {
             local.link_value->array_vals[0] = 12345;
             remote.link_value->array_vals.erase(remote.link_value->array_vals.begin());
             TopLevelContent expected_recovered = local;
             reset_embedded_object({local}, {remote}, expected_recovered);
         }
         SECTION("local ArrayErase to an embedded object through a deep link->linklist element which is removed by "
-                "the remote "
-                "triggers a list copy") {
+                "the remote triggers a list copy") {
             local.link_value->array_vals.erase(local.link_value->array_vals.begin());
             remote.link_value->array_vals.clear();
             TopLevelContent expected_recovered = local;
@@ -3632,21 +3820,19 @@ TEST_CASE("client reset with embedded object", "[sync][pbs][client reset][embedd
             expected_recovered.dict_values["foo"]->array_vals = local.dict_values["foo"]->array_vals;
             reset_embedded_object({local}, {remote}, expected_recovered);
         }
-        std::vector<std::string> keys = {"new key", "", "\0"};
-        for (auto key : keys) {
-            SECTION(util::format("both add the same dictionary key: '%1'", key)) {
-                EmbeddedContent new_local, new_remote;
-                local.dict_values[key] = new_local;
-                remote.dict_values[key] = new_remote;
-                TopLevelContent expected_recovered = remote;
-                expected_recovered.dict_values[key]->apply_recovery_from(*local.dict_values[key]);
-                // a verbatim list copy is triggered by modifications to items which were not just inserted
-                expected_recovered.dict_values[key]->array_vals = local.dict_values[key]->array_vals;
-                expected_recovered.dict_values[key]->second_level = local.dict_values[key]->second_level;
-                reset_embedded_object({local}, {remote}, expected_recovered);
-            }
+        SECTION("both add the same dictionary key") {
+            auto key = GENERATE("new key", "", "\0");
+            EmbeddedContent new_local, new_remote;
+            local.dict_values[key] = new_local;
+            remote.dict_values[key] = new_remote;
+            TopLevelContent expected_recovered = remote;
+            expected_recovered.dict_values[key]->apply_recovery_from(*local.dict_values[key]);
+            // a verbatim list copy is triggered by modifications to items which were not just inserted
+            expected_recovered.dict_values[key]->array_vals = local.dict_values[key]->array_vals;
+            expected_recovered.dict_values[key]->second_level = local.dict_values[key]->second_level;
+            reset_embedded_object({local}, {remote}, expected_recovered);
         }
-        SECTION("deep modifications to inserted and swaped list items are recovered") {
+        SECTION("deep modifications to inserted and swapped list items are recovered") {
             EmbeddedContent local_added_at_begin, local_added_at_end, local_added_before_end, remote_added;
             size_t list_end = initial.array_values.size();
             test_reset
@@ -3656,14 +3842,14 @@ TEST_CASE("client reset with embedded object", "[sync][pbs][client reset][embedd
                     auto embedded = list.create_and_insert_linked_object(0);
                     local_added_at_begin.assign_to(embedded);
                     embedded = list.create_and_insert_linked_object(list_end - 1);
-                    local_added_before_end.assign_to(embedded); // this item is needed here so that move does not
-                                                                // trigger a copy of the list
+                    // this item is needed here so that move does not trigger a copy of the list
+                    local_added_before_end.assign_to(embedded);
                     embedded = list.create_and_insert_linked_object(list_end);
                     local_added_at_end.assign_to(embedded);
                     local->commit_transaction();
                     local->begin_transaction();
-                    list.swap(0,
-                              list_end); // generates two move instructions, move(0, list_end), move(list_end - 1, 0)
+                    // generates two move instructions, move(0, list_end), move(list_end - 1, 0)
+                    list.swap(0, list_end);
                     local->commit_transaction();
                     local->begin_transaction();
                     local_added_at_end.name = "should be at begin now";
@@ -3995,7 +4181,7 @@ TEST_CASE("client reset with embedded object", "[sync][pbs][client reset][embedd
                 Obj obj = get_top_object(realm);
                 auto dict = obj.get_dictionary("embedded_dict");
                 auto embedded = dict.get_object(key);
-                REQUIRE(!!embedded);
+                REQUIRE(embedded);
                 embedded.add_int("int_value", addition);
                 return TopLevelContent::get_from(obj);
             };
@@ -4092,7 +4278,7 @@ TEST_CASE("client reset with embedded object", "[sync][pbs][client reset][embedd
         reset_embedded_object({local}, {remote}, expected_recovered);
     }
     SECTION("server adds embedded object classes") {
-        SyncTestFile config2(init_sync_manager.app(), "default");
+        SyncTestFile config2(oas.app()->current_user(), "default");
         config2.schema = config.schema;
         config.schema = Schema{shared_class};
         test_reset = reset_utils::make_fake_local_client_reset(config, config2);
@@ -4117,7 +4303,7 @@ TEST_CASE("client reset with embedded object", "[sync][pbs][client reset][embedd
             ->run();
     }
     SECTION("client adds embedded object classes") {
-        SyncTestFile config2(init_sync_manager.app(), "default");
+        SyncTestFile config2(oas.app()->current_user(), "default");
         config2.schema = Schema{shared_class};
         test_reset = reset_utils::make_fake_local_client_reset(config, config2);
         TopLevelContent local_content;
@@ -4142,5 +4328,1605 @@ TEST_CASE("client reset with embedded object", "[sync][pbs][client reset][embedd
                 })
                 ->run();
         }
+    }
+}
+
+TEST_CASE("client reset with nested collection", "[client reset][local][nested collection]") {
+
+    if (!util::EventLoop::has_implementation())
+        return;
+
+    OfflineAppSession oas;
+    SyncTestFile config(oas, "default");
+    config.cache = false;
+    config.automatic_change_notifications = false;
+    ClientResyncMode test_mode = GENERATE(ClientResyncMode::DiscardLocal, ClientResyncMode::Recover);
+    CAPTURE(test_mode);
+    config.sync_config->client_resync_mode = test_mode;
+
+    ObjectSchema shared_class = {"object",
+                                 {
+                                     {"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
+                                     {"value", PropertyType::Int},
+                                 }};
+
+    config.schema = Schema{shared_class,
+                           {"TopLevel",
+                            {
+                                {"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
+                                {"any_mixed", PropertyType::Mixed | PropertyType::Nullable},
+                            }}};
+
+    SECTION("add nested collection locally") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = Schema{shared_class};
+
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset->make_local_changes([&](SharedRealm local) {
+            advance_and_notify(*local);
+            TableRef table = get_table(*local, "TopLevel");
+            auto obj = table->create_object_with_primary_key(pk_val);
+            auto col = table->get_column_key("any_mixed");
+            obj.set_collection(col, CollectionType::List);
+            List list{local, obj, col};
+            list.insert_collection(0, CollectionType::List);
+            auto nlist = list.get_list(0);
+            nlist.add(Mixed{10});
+            nlist.add(Mixed{"Test"});
+            REQUIRE(table->size() == 1);
+        });
+        if (test_mode == ClientResyncMode::DiscardLocal) {
+            REQUIRE_THROWS_WITH(test_reset->run(), "Client reset cannot recover when classes have been removed: "
+                                                   "{TopLevel}");
+        }
+        else {
+            test_reset
+                ->on_post_reset([&](SharedRealm local) {
+                    advance_and_notify(*local);
+                    TableRef table = get_table(*local, "TopLevel");
+                    REQUIRE(table->size() == 1);
+                    auto obj = table->get_object(0);
+                    auto col = table->get_column_key("any_mixed");
+                    List list{local, obj, col};
+                    REQUIRE(list.size() == 1);
+                    auto nlist = list.get_list(0);
+                    REQUIRE(nlist.size() == 2);
+                    REQUIRE(nlist.get_any(0).get_int() == 10);
+                    REQUIRE(nlist.get_any(1).get_string() == "Test");
+                })
+                ->run();
+        }
+    }
+    SECTION("server adds nested collection. List of nested collections") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        config.schema = Schema{shared_class};
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+
+        test_reset
+            ->make_remote_changes([&](SharedRealm remote) {
+                advance_and_notify(*remote);
+                TableRef table = get_table(*remote, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                // List
+                obj.set_collection(col, CollectionType::List);
+                List list{remote, obj, col};
+                // primitive type
+                list.add(Mixed{42});
+                // List<List<Mixed>>
+                list.insert_collection(1, CollectionType::List);
+                auto nlist = list.get_list(1);
+                nlist.add(Mixed{10});
+                nlist.add(Mixed{"Test"});
+                // List<Dictionary>
+                list.insert_collection(2, CollectionType::Dictionary);
+                auto n_dict = list.get_dictionary(2);
+                n_dict.insert("Test", Mixed{"10"});
+                n_dict.insert("Test1", Mixed{10});
+                REQUIRE(list.size() == 3);
+                REQUIRE(table->size() == 1);
+            })
+            ->on_post_reset([&](SharedRealm local) {
+                advance_and_notify(*local);
+                TableRef table = get_table(*local, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local, obj, col};
+                REQUIRE(list.size() == 3);
+                auto mixed = list.get_any(0);
+                REQUIRE(mixed.get_int() == 42);
+                auto nlist = list.get_list(1);
+                REQUIRE(nlist.size() == 2);
+                REQUIRE(nlist.get_any(0).get_int() == 10);
+                REQUIRE(nlist.get_any(1).get_string() == "Test");
+                auto n_dict = list.get_dictionary(2);
+                REQUIRE(n_dict.size() == 2);
+                REQUIRE(n_dict.get<Mixed>("Test").get_string() == "10");
+                REQUIRE(n_dict.get<Mixed>("Test1").get_int() == 10);
+            })
+            ->run();
+    }
+    SECTION("server adds nested collection. Dictionary of nested collections") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        config.schema = Schema{shared_class};
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->make_remote_changes([&](SharedRealm remote) {
+                advance_and_notify(*remote);
+                TableRef table = get_table(*remote, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                // List
+                obj.set_collection(col, CollectionType::Dictionary);
+                object_store::Dictionary dict{remote, obj, col};
+                // primitive type
+                dict.insert("Scalar", Mixed{42});
+                // Dictionary<List<Mixed>>
+                dict.insert_collection("List", CollectionType::List);
+                auto nlist = dict.get_list("List");
+                nlist.add(Mixed{10});
+                nlist.add(Mixed{"Test"});
+                // Dictionary<Dictionary>
+                dict.insert_collection("Dict", CollectionType::Dictionary);
+                auto n_dict = dict.get_dictionary("Dict");
+                n_dict.insert("Test", Mixed{"10"});
+                n_dict.insert("Test1", Mixed{10});
+                REQUIRE(dict.size() == 3);
+                REQUIRE(table->size() == 1);
+            })
+            ->on_post_reset([&](SharedRealm local) {
+                advance_and_notify(*local);
+                TableRef table = get_table(*local, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                object_store::Dictionary dict{local, obj, col};
+                REQUIRE(dict.size() == 3);
+                auto mixed = dict.get_any("Scalar");
+                REQUIRE(mixed.get_int() == 42);
+                auto nlist = dict.get_list("List");
+                REQUIRE(nlist.size() == 2);
+                REQUIRE(nlist.get_any(0).get_int() == 10);
+                REQUIRE(nlist.get_any(1).get_string() == "Test");
+                auto n_dict = dict.get_dictionary("Dict");
+                REQUIRE(n_dict.size() == 2);
+                REQUIRE(n_dict.get<Mixed>("Test").get_string() == "10");
+                REQUIRE(n_dict.get<Mixed>("Test1").get_int() == 10);
+            })
+            ->run();
+    }
+    SECTION("add nested collection both locally and remotely List vs Dictionary") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->make_local_changes([&](SharedRealm local) {
+                advance_and_notify(*local);
+                auto table = get_table(*local, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{local, obj, col};
+                list.insert(0, Mixed{30});
+                REQUIRE(list.size() == 1);
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                auto table = get_table(*remote_realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::Dictionary);
+                object_store::Dictionary dict{remote_realm, obj, col};
+                dict.insert("Test", Mixed{40});
+                REQUIRE(dict.size() == 1);
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    TableRef table = get_table(*local_realm, "TopLevel");
+                    REQUIRE(table->size() == 1);
+                    auto obj = table->get_object(0);
+                    auto col = table->get_column_key("any_mixed");
+                    object_store::Dictionary dictionary{local_realm, obj, col};
+                    REQUIRE(dictionary.size() == 1);
+                    REQUIRE(dictionary.get_any("Test").get_int() == 40);
+                }
+                else {
+                    TableRef table = get_table(*local_realm, "TopLevel");
+                    REQUIRE(table->size() == 1);
+                    auto obj = table->get_object(0);
+                    auto col = table->get_column_key("any_mixed");
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 1);
+                    REQUIRE(list.get_any(0) == 30);
+                }
+            })
+            ->run();
+    }
+    SECTION("add nested collection both locally and remotely. Nesting levels mismatch List vs Dictionary") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->make_local_changes([&](SharedRealm local) {
+                advance_and_notify(*local);
+                auto table = get_table(*local, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{local, obj, col};
+                list.insert_collection(0, CollectionType::Dictionary);
+                auto dict = list.get_dictionary(0);
+                dict.insert("Test", Mixed{30});
+                REQUIRE(list.size() == 1);
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                auto table = get_table(*remote_realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{remote_realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto nlist = list.get_list(0);
+                nlist.insert(0, Mixed{30});
+                REQUIRE(nlist.size() == 1);
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    TableRef table = get_table(*local_realm, "TopLevel");
+                    REQUIRE(table->size() == 1);
+                    auto obj = table->get_object(0);
+                    auto col = table->get_column_key("any_mixed");
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 1);
+                    auto nlist = list.get_list(0);
+                    REQUIRE(nlist.size() == 1);
+                    REQUIRE(nlist.get<Mixed>(0).get_int() == 30);
+                }
+                else {
+                    TableRef table = get_table(*local_realm, "TopLevel");
+                    REQUIRE(table->size() == 1);
+                    auto obj = table->get_object(0);
+                    auto col = table->get_column_key("any_mixed");
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 2);
+                    auto n_dict = list.get_dictionary(0);
+                    REQUIRE(n_dict.size() == 1);
+                    REQUIRE(n_dict.get<Mixed>("Test").get_int() == 30);
+                    auto n_list = list.get_list(1);
+                    REQUIRE(n_list.size() == 1);
+                    REQUIRE(n_list.get_any(0) == 30);
+                }
+            })
+            ->run();
+    }
+    SECTION("add nested collection both locally and remotely. Collections matched. Merge collections if not discard "
+            "local") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->make_local_changes([&](SharedRealm local) {
+                advance_and_notify(*local);
+                auto table = get_table(*local, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{local, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{30});
+                list.insert_collection(1, CollectionType::Dictionary);
+                auto dict = list.get_dictionary(1);
+                dict.insert("Test", Mixed{10});
+                REQUIRE(list.size() == 2);
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                auto table = get_table(*remote_realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{remote_realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{40});
+                list.insert_collection(1, CollectionType::Dictionary);
+                auto dict = list.get_dictionary(1);
+                dict.insert("Test1", Mixed{11});
+                REQUIRE(list.size() == 2);
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local_realm, obj, col};
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    REQUIRE(list.size() == 2);
+                    auto n_list = list.get_list(0);
+                    REQUIRE(n_list.get_any(0).get_int() == 40);
+                    auto n_dict = list.get_dictionary(1);
+                    REQUIRE(n_dict.size() == 1);
+                    REQUIRE(n_dict.get<Mixed>("Test1").get_int() == 11);
+                }
+                else {
+                    REQUIRE(list.size() == 4);
+                    auto n_list = list.get_list(0);
+                    REQUIRE(n_list.size() == 1);
+                    REQUIRE(n_list.get_any(0).get_int() == 30);
+                    auto n_dict = list.get_dictionary(1);
+                    REQUIRE(n_dict.size() == 1);
+                    REQUIRE(n_dict.get<Mixed>("Test").get_int() == 10);
+                    auto n_list1 = list.get_list(2);
+                    REQUIRE(n_list1.size() == 1);
+                    REQUIRE(n_list1.get_any(0).get_int() == 40);
+                    auto n_dict1 = list.get_dictionary(3);
+                    REQUIRE(n_dict1.size() == 1);
+                    REQUIRE(n_dict1.get<Mixed>("Test1").get_int() == 11);
+                }
+            })
+            ->run();
+    }
+    SECTION("add nested collection both locally and remotely. Collections matched. Mix collections with values") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->make_local_changes([&](SharedRealm local) {
+                advance_and_notify(*local);
+                auto table = get_table(*local, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{local, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{30});
+                list.insert_collection(1, CollectionType::Dictionary);
+                auto dict = list.get_dictionary(1);
+                dict.insert("Test", Mixed{10});
+                list.insert(0, Mixed{2}); // this shifts all the other collections by 1
+                REQUIRE(list.size() == 3);
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                auto table = get_table(*remote_realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{remote_realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{40});
+                list.insert_collection(1, CollectionType::Dictionary);
+                auto dict = list.get_dictionary(1);
+                dict.insert("Test1", Mixed{11});
+                list.insert(0, Mixed{30}); // this shifts all the other collections by 1
+                REQUIRE(list.size() == 3);
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local_realm, obj, col};
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    REQUIRE(list.size() == 3);
+                    REQUIRE(list.get_any(0).get_int() == 30);
+                    auto n_list = list.get_list(1);
+                    REQUIRE(n_list.get_any(0).get_int() == 40);
+                    auto n_dict = list.get_dictionary(2);
+                    REQUIRE(n_dict.size() == 1);
+                    REQUIRE(n_dict.get<Mixed>("Test1").get_int() == 11);
+                }
+                else {
+                    // local
+                    REQUIRE(list.size() == 6);
+                    REQUIRE(list.get_any(0).get_int() == 2);
+                    auto n_list = list.get_list(1);
+                    REQUIRE(n_list.size() == 1);
+                    REQUIRE(n_list.get_any(0).get_int() == 30);
+                    auto n_dict = list.get_dictionary(2);
+                    REQUIRE(n_dict.size() == 1);
+                    REQUIRE(n_dict.get<Mixed>("Test").get_int() == 10);
+                    // remote
+                    REQUIRE(list.get_any(3).get_int() == 30);
+                    auto n_list1 = list.get_list(4);
+                    REQUIRE(n_list1.size() == 1);
+                    REQUIRE(n_list1.get_any(0).get_int() == 40);
+                    auto n_dict1 = list.get_dictionary(5);
+                    REQUIRE(n_dict1.size() == 1);
+                    REQUIRE(n_dict1.get<Mixed>("Test1").get_int() == 11);
+                }
+            })
+            ->run();
+    }
+    SECTION("add nested collection both locally and remotely. Collections do not match") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->make_local_changes([&](SharedRealm local) {
+                advance_and_notify(*local);
+                auto table = get_table(*local, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{local, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{30});
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                auto table = get_table(*remote_realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::Dictionary);
+                object_store::Dictionary dict{remote_realm, obj, col};
+                dict.insert_collection("List", CollectionType::List);
+                auto n_list = dict.get_list("List");
+                n_list.insert(0, Mixed{30});
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    object_store::Dictionary dict{local_realm, obj, col};
+                    REQUIRE(dict.size() == 1);
+                    auto n_list = dict.get_list("List");
+                    REQUIRE(n_list.size() == 1);
+                    REQUIRE(n_list.get_any(0).get_int() == 30);
+                }
+                else {
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 1);
+                    auto n_list = list.get_list(0);
+                    REQUIRE(n_list.size() == 1);
+                    REQUIRE(n_list.get_any(0).get_int() == 30);
+                }
+            })
+            ->run();
+    }
+    SECTION("delete collection remotely and add locally. Collections do not match") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{30});
+                list.insert_collection(1, CollectionType::List);
+                n_list = list.get_list(1);
+                n_list.insert(0, Mixed{31});
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local_realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{50});
+                REQUIRE(list.size() == 3);
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{remote_realm, obj, col};
+                REQUIRE(list.size() == 2);
+                list.remove(0);
+                auto n_list = list.get_list(0);
+                REQUIRE(n_list.get_any(0).get_int() == 31);
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 1);
+                    auto n_list = list.get_list(0);
+                    REQUIRE(n_list.get_any(0).get_int() == 31);
+                }
+                else {
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 2);
+                    auto n_list1 = list.get_list(0);
+                    auto n_list2 = list.get_list(1);
+                    REQUIRE(n_list1.size() == 1);
+                    REQUIRE(n_list2.size() == 1);
+                    REQUIRE(n_list1.get_any(0).get_int() == 50);
+                    REQUIRE(n_list2.get_any(0).get_int() == 31);
+                }
+            })
+            ->run();
+    }
+    SECTION("delete collection remotely and add locally same index.") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{30});
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local_realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{50});
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{remote_realm, obj, col};
+                REQUIRE(list.size() == 1);
+                list.remove(0);
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    TableRef table = get_table(*local_realm, "TopLevel");
+                    REQUIRE(table->size() == 1);
+                    auto obj = table->get_object(0);
+                    auto col = table->get_column_key("any_mixed");
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 0);
+                }
+                else {
+                    TableRef table = get_table(*local_realm, "TopLevel");
+                    REQUIRE(table->size() == 1);
+                    auto obj = table->get_object(0);
+                    auto col = table->get_column_key("any_mixed");
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 1);
+                    auto nlist = list.get_list(0);
+                    REQUIRE(nlist.size() == 1);
+                    REQUIRE(nlist.get_any(0).get_int() == 50);
+                }
+            })
+            ->run();
+    }
+    SECTION("shift collection remotely and locally") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{30});
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local_realm, obj, col};
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{50});
+                list.insert_collection(0, CollectionType::List); // shift
+                auto n_list1 = list.get_list(0);
+                n_list1.insert(0, Mixed{150});
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{remote_realm, obj, col};
+                auto n_list = list.get_list(0);
+                n_list.insert(1, Mixed{100});
+                list.insert_collection(0, CollectionType::List); // shift
+                auto n_list1 = list.get_list(0);
+                n_list1.insert(0, Mixed{42});
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 2);
+                    auto n_list = list.get_list(0);
+                    auto n_list1 = list.get_list(1);
+                    REQUIRE(n_list.size() == 1);
+                    REQUIRE(n_list1.size() == 2);
+                    REQUIRE(n_list1.get_any(0).get_int() == 30);
+                    REQUIRE(n_list1.get_any(1).get_int() == 100);
+                    REQUIRE(n_list.get_any(0).get_int() == 42);
+                }
+                else {
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 3);
+                    auto n_list = list.get_list(0);
+                    auto n_list1 = list.get_list(1);
+                    auto n_list2 = list.get_list(2);
+                    REQUIRE(n_list.size() == 1);
+                    REQUIRE(n_list1.size() == 2);
+                    REQUIRE(n_list2.size() == 2);
+                    REQUIRE(n_list.get_any(0).get_int() == 150);
+                    REQUIRE(n_list1.get_any(0).get_int() == 50);
+                    REQUIRE(n_list1.get_any(1).get_int() == 42);
+                    REQUIRE(n_list2.get_any(0).get_int() == 30);
+                    REQUIRE(n_list2.get_any(1).get_int() == 100);
+                }
+            })
+            ->run();
+    }
+    SECTION("delete collection locally (list). Local should win") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{30});
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local_realm, obj, col};
+                REQUIRE(list.size() == 1);
+                list.remove(0);
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{remote_realm, obj, col};
+                list.add(Mixed{10});
+                REQUIRE(list.size() == 2);
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 2);
+                    auto n_list1 = list.get_list(0);
+                    auto mixed = list.get_any(1);
+                    REQUIRE(n_list1.size() == 1);
+                    REQUIRE(mixed.get_int() == 10);
+                    REQUIRE(n_list1.get_any(0).get_int() == 30);
+                }
+                else {
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 0);
+                }
+            })
+            ->run();
+    }
+    SECTION("move collection locally (list). Local should win") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto n_list = list.get_list(0);
+                n_list.insert(0, Mixed{30});
+                n_list.insert(1, Mixed{10});
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local_realm, obj, col};
+                auto nlist = list.get_list(0);
+                nlist.move(0, 1); // move value 30 in pos 1.
+                REQUIRE(nlist.size() == 2);
+                REQUIRE(nlist.get_any(0).get_int() == 10);
+                REQUIRE(nlist.get_any(1).get_int() == 30);
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{remote_realm, obj, col};
+                REQUIRE(list.size() == 1);
+                auto nlist = list.get_list(0);
+                REQUIRE(nlist.size() == 2);
+                nlist.add(Mixed{2});
+                REQUIRE(nlist.size() == 3);
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    // local state is preserved
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 1);
+                    auto nlist = list.get_list(0);
+                    REQUIRE(nlist.size() == 3);
+                    REQUIRE(nlist.get_any(0).get_int() == 30);
+                    REQUIRE(nlist.get_any(1).get_int() == 10);
+                    REQUIRE(nlist.get_any(2).get_int() == 2);
+                }
+                else {
+                    // local change wins
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 1);
+                    auto nlist = list.get_list(0);
+                    REQUIRE(nlist.size() == 2);
+                    REQUIRE(nlist.get_any(0).get_int() == 10);
+                    REQUIRE(nlist.get_any(1).get_int() == 30);
+                }
+            })
+            ->run();
+    }
+    SECTION("delete collection locally (dictionary). Local should win") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::Dictionary);
+                object_store::Dictionary dictionary{realm, obj, col};
+                dictionary.insert_collection("Test", CollectionType::Dictionary);
+                auto n_dictionary = dictionary.get_dictionary("Test");
+                n_dictionary.insert("Val", 30);
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                object_store::Dictionary dictionary{local_realm, obj, col};
+                REQUIRE(dictionary.size() == 1);
+                dictionary.erase("Test");
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                object_store::Dictionary dictionary{remote_realm, obj, col};
+                REQUIRE(dictionary.size() == 1);
+                auto n_dictionary = dictionary.get_dictionary("Test");
+                n_dictionary.insert("Val1", 31);
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    object_store::Dictionary dictionary{local_realm, obj, col};
+                    REQUIRE(dictionary.size() == 1);
+                    auto n_dictionary = dictionary.get_dictionary("Test");
+                    REQUIRE(n_dictionary.get_any("Val").get_int() == 30);
+                    REQUIRE(n_dictionary.get_any("Val1").get_int() == 31);
+                }
+                else {
+                    // local change wins
+                    object_store::Dictionary dictionary{local_realm, obj, col};
+                    REQUIRE(dictionary.size() == 0);
+                }
+            })
+            ->run();
+    }
+    // testing copying logic for nested collections
+    SECTION("Verify copy logic for collections in mixed.") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                list.insert_collection(1, CollectionType::Dictionary);
+                auto nlist = list.get_list(0);
+                auto ndict = list.get_dictionary(1);
+                nlist.add(Mixed{1});
+                nlist.add(Mixed{"Test"});
+                ndict.insert("Int", Mixed(3));
+                ndict.insert("String", Mixed("Test"));
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local_realm, obj, col};
+                REQUIRE(list.size() == 2);
+                auto nlist = list.get_list(0);
+                nlist.add(Mixed{4});
+                auto ndict = list.get_dictionary(1);
+                ndict.insert("Int2", 6);
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{remote_realm, obj, col};
+                REQUIRE(list.size() == 2);
+                auto nlist = list.get_list(0);
+                nlist.add(Mixed{7});
+                auto ndict = list.get_dictionary(1);
+                ndict.insert("Int3", Mixed{9});
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    // db must be equal to remote
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 2);
+                    auto nlist = list.get_list(0);
+                    auto ndict = list.get_dictionary(1);
+                    REQUIRE(nlist.size() == 3);
+                    REQUIRE(ndict.size() == 3);
+                    REQUIRE(nlist.get_any(0).get_int() == 1);
+                    REQUIRE(nlist.get_any(1).get_string() == "Test");
+                    REQUIRE(nlist.get_any(2).get_int() == 7);
+                    REQUIRE(ndict.get_any("Int").get_int() == 3);
+                    REQUIRE(ndict.get_any("String").get_string() == "Test");
+                    REQUIRE(ndict.get_any("Int3").get_int() == 9);
+                }
+                else {
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 2);
+                    auto nlist = list.get_list(0);
+                    auto ndict = list.get_dictionary(1);
+                    REQUIRE(nlist.size() == 4);
+                    REQUIRE(ndict.size() == 4);
+                    REQUIRE(nlist.get_any(0).get_int() == 1);
+                    REQUIRE(nlist.get_any(1).get_string() == "Test");
+                    REQUIRE(nlist.get_any(2).get_int() == 4);
+                    REQUIRE(nlist.get_any(3).get_int() == 7);
+                    REQUIRE(ndict.get_any("Int").get_int() == 3);
+                    REQUIRE(ndict.get_any("String").get_string() == "Test");
+                    REQUIRE(ndict.get_any("Int2").get_int() == 6);
+                    REQUIRE(ndict.get_any("Int3").get_int() == 9);
+                }
+            })
+            ->run();
+    }
+    SECTION("Verify copy logic for collections in mixed. Mismatch at index i") {
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local_realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                auto nlist = list.get_list(0);
+                nlist.add(Mixed{"Local"});
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{remote_realm, obj, col};
+                list.insert_collection(0, CollectionType::Dictionary);
+                auto ndict = list.get_dictionary(0);
+                ndict.insert("Test", Mixed{"Remote"});
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    // db must be equal to remote
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 1);
+                    auto ndict = list.get_dictionary(0);
+                    REQUIRE(ndict.size() == 1);
+                    REQUIRE(ndict.get_any("Test").get_string() == "Remote");
+                }
+                else {
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 2);
+                    auto nlist = list.get_list(0);
+                    auto ndict = list.get_dictionary(1);
+                    REQUIRE(ndict.get_any("Test").get_string() == "Remote");
+                    REQUIRE(nlist.get_any(0).get_string() == "Local");
+                }
+            })
+            ->run();
+    }
+    SECTION("Verify copy and notification logic for List<List> and scalar types") {
+        Results results;
+        Object object;
+        List list_listener, nlist_setup_listener, nlist_local_listener;
+        CollectionChangeSet list_changes, nlist_setup_changes, nlist_local_changes;
+        NotificationToken list_token, nlist_setup_token, nlist_local_token;
+
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{realm, obj, col};
+                list.insert_collection(0, CollectionType::List);
+                list.add(Mixed{"Setup"});
+                auto nlist = list.get_list(0);
+                nlist.add(Mixed{"Setup"});
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local_realm, obj, col};
+                REQUIRE(list.size() == 2);
+                list.insert_collection(0, CollectionType::List);
+                list.add(Mixed{"Local"});
+                auto nlist = list.get_list(0);
+                nlist.add(Mixed{"Local"});
+            })
+            ->on_post_local_changes([&](SharedRealm realm) {
+                TableRef table = get_table(*realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                list_listener = List{realm, obj, col};
+                REQUIRE(list_listener.size() == 4);
+                list_token = list_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                    list_changes = std::move(changes);
+                });
+                auto nlist_setup = list_listener.get_list(1);
+                REQUIRE(nlist_setup.size() == 1);
+                REQUIRE(nlist_setup.get_any(0) == Mixed{"Setup"});
+                nlist_setup_listener = nlist_setup;
+                nlist_setup_token = nlist_setup_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                    nlist_setup_changes = std::move(changes);
+                });
+                auto nlist_local = list_listener.get_list(0);
+                REQUIRE(nlist_local.size() == 1);
+                REQUIRE(nlist_local.get_any(0) == Mixed{"Local"});
+                nlist_local_listener = nlist_local;
+                nlist_local_token = nlist_local_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                    nlist_local_changes = std::move(changes);
+                });
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{remote_realm, obj, col};
+                REQUIRE(list.size() == 2);
+                list.insert_collection(0, CollectionType::List);
+                list.add(Mixed{"Remote"});
+                auto nlist = list.get_list(0);
+                nlist.add(Mixed{"Remote"});
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    // db must be equal to remote
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 4);
+                    auto nlist_remote = list.get_list(0);
+                    auto nlist_setup = list.get_list(1);
+                    auto mixed_setup = list.get_any(2);
+                    auto mixed_remote = list.get_any(3);
+                    REQUIRE(nlist_remote.size() == 1);
+                    REQUIRE(nlist_setup.size() == 1);
+                    REQUIRE(mixed_setup.get_string() == "Setup");
+                    REQUIRE(mixed_remote.get_string() == "Remote");
+                    REQUIRE(nlist_remote.get_any(0).get_string() == "Remote");
+                    REQUIRE(nlist_setup.get_any(0).get_string() == "Setup");
+                    REQUIRE(list_listener.is_valid());
+                    REQUIRE_INDICES(list_changes.deletions);  // old nested collection deleted
+                    REQUIRE_INDICES(list_changes.insertions); // new nested collection inserted
+                    REQUIRE_INDICES(list_changes.modifications, 0,
+                                    3); // replace Local with Remote at position 0 and 3
+                    REQUIRE(!nlist_local_changes.collection_root_was_deleted); // original local collection deleted
+                    REQUIRE(!nlist_setup_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(nlist_setup_changes.insertions); // there are no new insertions or deletions
+                    REQUIRE_INDICES(nlist_setup_changes.deletions);
+                    REQUIRE_INDICES(nlist_setup_changes.modifications);
+                }
+                else {
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 6);
+                    auto nlist_local = list.get_list(0);
+                    auto nlist_remote = list.get_list(1);
+                    auto nlist_setup = list.get_list(2);
+                    auto mixed_local = list.get_any(3);
+                    auto mixed_setup = list.get_any(4);
+                    auto mixed_remote = list.get_any(5);
+                    // local, remote changes are kept
+                    REQUIRE(nlist_remote.size() == 1);
+                    REQUIRE(nlist_setup.size() == 1);
+                    REQUIRE(nlist_local.size() == 1);
+                    REQUIRE(mixed_setup.get_string() == "Setup");
+                    REQUIRE(mixed_remote.get_string() == "Remote");
+                    REQUIRE(mixed_local.get_string() == "Local");
+                    REQUIRE(nlist_remote.get_any(0).get_string() == "Remote");
+                    REQUIRE(nlist_local.get_any(0).get_string() == "Local");
+                    REQUIRE(nlist_setup.get_any(0).get_string() == "Setup");
+                    // notifications
+                    REQUIRE(list_listener.is_valid());
+                    // src is [ [Local],[Remote],[Setup], Local, Setup, Remote ]
+                    // dst is [ [Local], [Setup], Setup, Local]
+                    // no deletions
+                    REQUIRE_INDICES(list_changes.deletions);
+                    // inserted "Setup" and "Remote" at the end
+                    REQUIRE_INDICES(list_changes.insertions, 4, 5);
+                    // changed [Setup] ==> [Remote] and Setup ==> [Setup]
+                    REQUIRE_INDICES(list_changes.modifications, 1, 2);
+                    REQUIRE(!nlist_local_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(nlist_local_changes.insertions);
+                    REQUIRE_INDICES(nlist_local_changes.deletions);
+                    REQUIRE(!nlist_setup_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(nlist_setup_changes.insertions);
+                    REQUIRE_INDICES(nlist_setup_changes.deletions);
+                }
+            })
+            ->run();
+    }
+    SECTION("Verify copy and notification logic for Dictionary<List> and scalar types") {
+        Results results;
+        Object object;
+        object_store::Dictionary dictionary_listener;
+        List nlist_setup_listener, nlist_local_listener;
+        CollectionChangeSet dictionary_changes, nlist_setup_changes, nlist_local_changes;
+        NotificationToken dictionary_token, nlist_setup_token, nlist_local_token;
+
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::Dictionary);
+                object_store::Dictionary dictionary{realm, obj, col};
+                dictionary.insert_collection("[Setup]", CollectionType::List);
+                dictionary.insert("Setup", Mixed{"Setup"});
+                auto nlist = dictionary.get_list("[Setup]");
+                nlist.add(Mixed{"Setup"});
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                object_store::Dictionary dictionary{local_realm, obj, col};
+                REQUIRE(dictionary.size() == 2);
+                dictionary.insert_collection("[Local]", CollectionType::List);
+                dictionary.insert("Local", Mixed{"Local"});
+                auto nlist = dictionary.get_list("[Local]");
+                nlist.add(Mixed{"Local"});
+            })
+            ->on_post_local_changes([&](SharedRealm realm) {
+                TableRef table = get_table(*realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                dictionary_listener = object_store::Dictionary{realm, obj, col};
+                REQUIRE(dictionary_listener.size() == 4);
+                dictionary_token = dictionary_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                    dictionary_changes = std::move(changes);
+                });
+                auto nlist_setup = dictionary_listener.get_list("[Setup]");
+                REQUIRE(nlist_setup.size() == 1);
+                REQUIRE(nlist_setup.get_any(0) == Mixed{"Setup"});
+                nlist_setup_listener = nlist_setup;
+                nlist_setup_token = nlist_setup_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                    nlist_setup_changes = std::move(changes);
+                });
+                auto nlist_local = dictionary_listener.get_list("[Local]");
+                REQUIRE(nlist_local.size() == 1);
+                REQUIRE(nlist_local.get_any(0) == Mixed{"Local"});
+                nlist_local_listener = nlist_local;
+                nlist_local_token = nlist_local_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                    nlist_local_changes = std::move(changes);
+                });
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                object_store::Dictionary dictionary{remote_realm, obj, col};
+                REQUIRE(dictionary.size() == 2);
+                dictionary.insert_collection("[Remote]", CollectionType::List);
+                dictionary.insert("Remote", Mixed{"Remote"});
+                auto nlist = dictionary.get_list("[Remote]");
+                nlist.add(Mixed{"Remote"});
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    // db must be equal to remote
+                    object_store::Dictionary dictionary{local_realm, obj, col};
+                    REQUIRE(dictionary.size() == 4);
+                    auto nlist_remote = dictionary.get_list("[Remote]");
+                    auto nlist_setup = dictionary.get_list("[Setup]");
+                    auto mixed_setup = dictionary.get_any("Setup");
+                    auto mixed_remote = dictionary.get_any("Remote");
+                    REQUIRE(nlist_remote.size() == 1);
+                    REQUIRE(nlist_setup.size() == 1);
+                    REQUIRE(mixed_setup.get_string() == "Setup");
+                    REQUIRE(mixed_remote.get_string() == "Remote");
+                    REQUIRE(nlist_remote.get_any(0).get_string() == "Remote");
+                    REQUIRE(nlist_setup.get_any(0).get_string() == "Setup");
+                    REQUIRE(dictionary_listener.is_valid());
+                    REQUIRE_INDICES(dictionary_changes.deletions, 0, 2);  // remove [Local], Local
+                    REQUIRE_INDICES(dictionary_changes.insertions, 0, 2); // insert [Remote], Remote
+                    REQUIRE_INDICES(
+                        dictionary_changes.modifications); // replace Local with Remote at position 0 and 3
+                    REQUIRE(nlist_local_changes.collection_root_was_deleted); // local list is deleted
+                    REQUIRE(!nlist_setup_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(nlist_setup_changes.insertions); // there are no new insertions or deletions
+                    REQUIRE_INDICES(nlist_setup_changes.deletions);
+                    REQUIRE_INDICES(nlist_setup_changes.modifications);
+                }
+                else {
+                    object_store::Dictionary dictionary{local_realm, obj, col};
+                    REQUIRE(dictionary.size() == 6);
+                    auto nlist_local = dictionary.get_list("[Local]");
+                    auto nlist_remote = dictionary.get_list("[Remote]");
+                    auto nlist_setup = dictionary.get_list("[Setup]");
+                    auto mixed_local = dictionary.get_any("Local");
+                    auto mixed_setup = dictionary.get_any("Setup");
+                    auto mixed_remote = dictionary.get_any("Remote");
+                    // local, remote changes are kept
+                    REQUIRE(nlist_remote.size() == 1);
+                    REQUIRE(nlist_setup.size() == 1);
+                    REQUIRE(nlist_local.size() == 1);
+                    REQUIRE(mixed_setup.get_string() == "Setup");
+                    REQUIRE(mixed_remote.get_string() == "Remote");
+                    REQUIRE(mixed_local.get_string() == "Local");
+                    REQUIRE(nlist_remote.get_any(0).get_string() == "Remote");
+                    REQUIRE(nlist_local.get_any(0).get_string() == "Local");
+                    REQUIRE(nlist_setup.get_any(0).get_string() == "Setup");
+                    // notifications
+                    REQUIRE(dictionary_listener.is_valid());
+                    // src is [ [Local],[Remote],[Setup], Local, Setup, Remote ]
+                    // dst is [ [Local], [Setup], Setup, Local]
+                    // no deletions
+                    REQUIRE_INDICES(dictionary_changes.deletions);
+                    // inserted "[Remote]" and "Remote"
+                    REQUIRE_INDICES(dictionary_changes.insertions, 1, 4);
+                    REQUIRE_INDICES(dictionary_changes.modifications);
+                    REQUIRE(!nlist_local_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(nlist_local_changes.insertions);
+                    REQUIRE_INDICES(nlist_local_changes.deletions);
+                    REQUIRE(!nlist_setup_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(nlist_setup_changes.insertions);
+                    REQUIRE_INDICES(nlist_setup_changes.deletions);
+                }
+            })
+            ->run();
+    }
+    SECTION("Verify copy and notification logic for List<Dictionary> and scalar types") {
+        Results results;
+        Object object;
+        List list_listener;
+        object_store::Dictionary ndictionary_setup_listener, ndictionary_local_listener;
+        CollectionChangeSet list_changes, ndictionary_setup_changes, ndictionary_local_changes;
+        NotificationToken list_token, ndictionary_setup_token, ndictionary_local_token;
+
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::List);
+                List list{realm, obj, col};
+                list.insert_collection(0, CollectionType::Dictionary);
+                list.add(Mixed{"Setup"});
+                auto ndictionary = list.get_dictionary(0);
+                ndictionary.insert("Key", Mixed{"Setup"});
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{local_realm, obj, col};
+                REQUIRE(list.size() == 2);
+                list.insert_collection(0, CollectionType::Dictionary);
+                list.add(Mixed{"Local"});
+                auto ndictionary = list.get_dictionary(0);
+                ndictionary.insert("Key", Mixed{"Local"});
+            })
+            ->on_post_local_changes([&](SharedRealm realm) {
+                TableRef table = get_table(*realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                list_listener = List{realm, obj, col};
+                REQUIRE(list_listener.size() == 4);
+                list_token = list_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                    list_changes = std::move(changes);
+                });
+                auto ndictionary_setup = list_listener.get_dictionary(1);
+                REQUIRE(ndictionary_setup.size() == 1);
+                REQUIRE(ndictionary_setup.get_any("Key") == Mixed{"Setup"});
+                ndictionary_setup_listener = ndictionary_setup;
+                ndictionary_setup_token =
+                    ndictionary_setup_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                        ndictionary_setup_changes = std::move(changes);
+                    });
+                auto ndictionary_local = list_listener.get_dictionary(0);
+                REQUIRE(ndictionary_local.size() == 1);
+                REQUIRE(ndictionary_local.get_any("Key") == Mixed{"Local"});
+                ndictionary_local_listener = ndictionary_local;
+                ndictionary_local_token =
+                    ndictionary_local_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                        ndictionary_local_changes = std::move(changes);
+                    });
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                List list{remote_realm, obj, col};
+                REQUIRE(list.size() == 2);
+                list.insert_collection(0, CollectionType::Dictionary);
+                list.add(Mixed{"Remote"});
+                auto ndictionary = list.get_dictionary(0);
+                ndictionary.insert("Key", Mixed{"Remote"});
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    // db must be equal to remote
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 4);
+                    auto ndictionary_remote = list.get_dictionary(0);
+                    auto ndictionary_setup = list.get_dictionary(1);
+                    auto mixed_setup = list.get_any(2);
+                    auto mixed_remote = list.get_any(3);
+                    REQUIRE(ndictionary_remote.size() == 1);
+                    REQUIRE(ndictionary_setup.size() == 1);
+                    REQUIRE(mixed_setup.get_string() == "Setup");
+                    REQUIRE(mixed_remote.get_string() == "Remote");
+                    REQUIRE(ndictionary_remote.get_any("Key").get_string() == "Remote");
+                    REQUIRE(ndictionary_setup.get_any("Key").get_string() == "Setup");
+                    REQUIRE(list_listener.is_valid());
+                    REQUIRE_INDICES(list_changes.deletions);  // old nested collection deleted
+                    REQUIRE_INDICES(list_changes.insertions); // new nested collection inserted
+                    REQUIRE_INDICES(list_changes.modifications, 0,
+                                    3); // replace Local with Remote at position 0 and 3
+                    REQUIRE(
+                        !ndictionary_local_changes.collection_root_was_deleted); // original local collection deleted
+                    REQUIRE(!ndictionary_setup_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(ndictionary_setup_changes.insertions); // there are no new insertions or deletions
+                    REQUIRE_INDICES(ndictionary_setup_changes.deletions);
+                    REQUIRE_INDICES(ndictionary_setup_changes.modifications);
+                }
+                else {
+                    List list{local_realm, obj, col};
+                    REQUIRE(list.size() == 6);
+                    auto ndictionary_local = list.get_dictionary(0);
+                    auto ndictionary_remote = list.get_dictionary(1);
+                    auto ndictionary_setup = list.get_dictionary(2);
+                    auto mixed_local = list.get_any(3);
+                    auto mixed_setup = list.get_any(4);
+                    auto mixed_remote = list.get_any(5);
+                    // local, remote changes are kept
+                    REQUIRE(ndictionary_remote.size() == 1);
+                    REQUIRE(ndictionary_setup.size() == 1);
+                    REQUIRE(ndictionary_local.size() == 1);
+                    REQUIRE(mixed_setup.get_string() == "Setup");
+                    REQUIRE(mixed_remote.get_string() == "Remote");
+                    REQUIRE(mixed_local.get_string() == "Local");
+                    REQUIRE(ndictionary_remote.get_any("Key").get_string() == "Remote");
+                    REQUIRE(ndictionary_local.get_any("Key").get_string() == "Local");
+                    REQUIRE(ndictionary_setup.get_any("Key").get_string() == "Setup");
+                    // notifications
+                    REQUIRE(list_listener.is_valid());
+                    // src is [ [Local],[Remote],[Setup], Local, Setup, Remote ]
+                    // dst is [ [Local], [Setup], Setup, Local]
+                    // no deletions
+                    REQUIRE_INDICES(list_changes.deletions);
+                    // inserted "Setup" and "Remote" at the end
+                    REQUIRE_INDICES(list_changes.insertions, 4, 5);
+                    // changed [Setup] ==> [Remote] and Setup ==> [Setup]
+                    REQUIRE_INDICES(list_changes.modifications, 1, 2);
+                    REQUIRE(!ndictionary_local_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(ndictionary_local_changes.insertions);
+                    REQUIRE_INDICES(ndictionary_local_changes.deletions);
+                    REQUIRE(!ndictionary_setup_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(ndictionary_setup_changes.insertions);
+                    REQUIRE_INDICES(ndictionary_setup_changes.deletions);
+                }
+            })
+            ->run();
+    }
+    SECTION("Verify copy and notification logic for Dictionary<Dictionary> and scalar types") {
+        Results results;
+        Object object;
+        object_store::Dictionary dictionary_listener, ndictionary_setup_listener, ndictionary_local_listener;
+        CollectionChangeSet dictionary_changes, ndictionary_setup_changes, ndictionary_local_changes;
+        NotificationToken dictionary_token, ndictionary_setup_token, ndictionary_local_token;
+
+        ObjectId pk_val = ObjectId::gen();
+        SyncTestFile config2(oas.app()->current_user(), "default");
+        config2.schema = config.schema;
+        auto test_reset = reset_utils::make_fake_local_client_reset(config, config2);
+        test_reset
+            ->setup([&](SharedRealm realm) {
+                auto table = get_table(*realm, "TopLevel");
+                auto obj = table->create_object_with_primary_key(pk_val);
+                auto col = table->get_column_key("any_mixed");
+                obj.set_collection(col, CollectionType::Dictionary);
+                object_store::Dictionary dictionary{realm, obj, col};
+                dictionary.insert_collection("<Setup>", CollectionType::Dictionary);
+                dictionary.insert("Key-Setup", Mixed{"Setup"});
+                auto ndictionary = dictionary.get_dictionary("<Setup>");
+                ndictionary.insert("Key", Mixed{"Setup"});
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                object_store::Dictionary dictionary{local_realm, obj, col};
+                dictionary.insert_collection("<Local>", CollectionType::Dictionary);
+                dictionary.insert("Key-Local", Mixed{"Local"});
+                auto ndictionary = dictionary.get_dictionary("<Local>");
+                ndictionary.insert("Key", Mixed{"Local"});
+            })
+            ->on_post_local_changes([&](SharedRealm realm) {
+                TableRef table = get_table(*realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                dictionary_listener = object_store::Dictionary{realm, obj, col};
+                REQUIRE(dictionary_listener.size() == 4);
+                dictionary_token = dictionary_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                    dictionary_changes = std::move(changes);
+                });
+                auto ndictionary_setup = dictionary_listener.get_dictionary("<Setup>");
+                REQUIRE(ndictionary_setup.size() == 1);
+                REQUIRE(ndictionary_setup.get_any("Key") == Mixed{"Setup"});
+                ndictionary_setup_listener = ndictionary_setup;
+                ndictionary_setup_token =
+                    ndictionary_setup_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                        ndictionary_setup_changes = std::move(changes);
+                    });
+                auto ndictionary_local = dictionary_listener.get_dictionary("<Local>");
+                REQUIRE(ndictionary_local.size() == 1);
+                REQUIRE(ndictionary_local.get_any("Key") == Mixed{"Local"});
+                ndictionary_local_listener = ndictionary_local;
+                ndictionary_local_token =
+                    ndictionary_local_listener.add_notification_callback([&](CollectionChangeSet changes) {
+                        ndictionary_local_changes = std::move(changes);
+                    });
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                advance_and_notify(*remote_realm);
+                TableRef table = get_table(*remote_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+                object_store::Dictionary dictionary{remote_realm, obj, col};
+                REQUIRE(dictionary.size() == 2);
+                dictionary.insert_collection("<Remote>", CollectionType::Dictionary);
+                dictionary.insert("Key-Remote", Mixed{"Remote"});
+                auto ndictionary = dictionary.get_dictionary("<Remote>");
+                ndictionary.insert("Key", Mixed{"Remote"});
+            })
+            ->on_post_reset([&](SharedRealm local_realm) {
+                advance_and_notify(*local_realm);
+                TableRef table = get_table(*local_realm, "TopLevel");
+                REQUIRE(table->size() == 1);
+                auto obj = table->get_object(0);
+                auto col = table->get_column_key("any_mixed");
+
+                if (test_mode == ClientResyncMode::DiscardLocal) {
+                    // db must be equal to remote
+                    object_store::Dictionary dictionary{local_realm, obj, col};
+                    REQUIRE(dictionary.size() == 4);
+                    auto ndictionary_remote = dictionary.get_dictionary("<Remote>");
+                    auto ndictionary_setup = dictionary.get_dictionary("<Setup>");
+                    auto mixed_setup = dictionary.get_any("Key-Setup");
+                    auto mixed_remote = dictionary.get_any("Key-Remote");
+                    REQUIRE(ndictionary_remote.size() == 1);
+                    REQUIRE(ndictionary_setup.size() == 1);
+                    REQUIRE(mixed_setup.get_string() == "Setup");
+                    REQUIRE(mixed_remote.get_string() == "Remote");
+                    REQUIRE(ndictionary_remote.get_any("Key").get_string() == "Remote");
+                    REQUIRE(ndictionary_setup.get_any("Key").get_string() == "Setup");
+                    REQUIRE(dictionary_listener.is_valid());
+                    REQUIRE_INDICES(dictionary_changes.deletions, 0, 2);
+                    REQUIRE_INDICES(dictionary_changes.insertions, 0, 2);
+                    REQUIRE_INDICES(dictionary_changes.modifications);
+                    REQUIRE(ndictionary_local_changes.collection_root_was_deleted);
+                    REQUIRE(!ndictionary_setup_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(ndictionary_setup_changes.insertions);
+                    REQUIRE_INDICES(ndictionary_setup_changes.deletions);
+                    REQUIRE_INDICES(ndictionary_setup_changes.modifications);
+                }
+                else {
+                    object_store::Dictionary dictionary{local_realm, obj, col};
+                    REQUIRE(dictionary.size() == 6);
+                    auto ndictionary_local = dictionary.get_dictionary("<Local>");
+                    auto ndictionary_remote = dictionary.get_dictionary("<Remote>");
+                    auto ndictionary_setup = dictionary.get_dictionary("<Setup>");
+                    auto mixed_local = dictionary.get_any("Key-Local");
+                    auto mixed_setup = dictionary.get_any("Key-Setup");
+                    auto mixed_remote = dictionary.get_any("Key-Remote");
+                    // local, remote changes are kept
+                    REQUIRE(ndictionary_remote.size() == 1);
+                    REQUIRE(ndictionary_setup.size() == 1);
+                    REQUIRE(ndictionary_local.size() == 1);
+                    REQUIRE(mixed_setup.get_string() == "Setup");
+                    REQUIRE(mixed_remote.get_string() == "Remote");
+                    REQUIRE(mixed_local.get_string() == "Local");
+                    REQUIRE(ndictionary_remote.get_any("Key").get_string() == "Remote");
+                    REQUIRE(ndictionary_local.get_any("Key").get_string() == "Local");
+                    REQUIRE(ndictionary_setup.get_any("Key").get_string() == "Setup");
+                    // notifications
+                    REQUIRE(dictionary_listener.is_valid());
+                    // src is [ [Local],[Remote],[Setup], Local, Setup, Remote ]
+                    // dst is [ [Local], [Setup], Setup, Local]
+                    // no deletions
+                    REQUIRE_INDICES(dictionary_changes.deletions);
+                    REQUIRE_INDICES(dictionary_changes.insertions, 1, 4);
+                    REQUIRE_INDICES(dictionary_changes.modifications);
+                    REQUIRE(!ndictionary_local_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(ndictionary_local_changes.insertions);
+                    REQUIRE_INDICES(ndictionary_local_changes.deletions);
+                    REQUIRE(!ndictionary_setup_changes.collection_root_was_deleted);
+                    REQUIRE_INDICES(ndictionary_setup_changes.insertions);
+                    REQUIRE_INDICES(ndictionary_setup_changes.deletions);
+                }
+            })
+            ->run();
     }
 }

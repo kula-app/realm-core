@@ -74,7 +74,7 @@ static void out_dec(char** buffer, unsigned val, int width)
 static constexpr long epoc_julian_days = date_to_julian(1970, 1, 1); // 2440588
 static constexpr int seconds_in_a_day = 24 * 60 * 60;
 
-const char* Timestamp::to_string(char* buffer) const
+const char* Timestamp::to_string(std::array<char, 32>& buffer) const
 {
     if (is_null()) {
         return "null";
@@ -105,7 +105,7 @@ const char* Timestamp::to_string(char* buffer) const
 
     julian_to_date(julian_days, &year, &month, &day);
 
-    char* p = buffer;
+    char* p = buffer.data();
     if (year < 0) {
         *p++ = '-';
         year = -year;
@@ -123,9 +123,9 @@ const char* Timestamp::to_string(char* buffer) const
     out_dec(&p, secs, 2);
     *p = '\0';
     if (nano) {
-        snprintf(p, 32 - (p - buffer), ".%09d", nano);
+        snprintf(p, 32 - (p - buffer.data()), ".%09d", nano);
     }
-    return buffer;
+    return buffer.data();
 }
 
 namespace util {
@@ -137,7 +137,7 @@ std::string print_value<>(BinaryData data)
     if (data.is_null()) {
         return "NULL";
     }
-    return print_value<StringData>(StringData(data.data(), data.size()));
+    return util::format("binary(%1)", print_value<StringData>(StringData(data.data(), data.size())));
 }
 
 template <>
@@ -227,7 +227,7 @@ std::string print_value<>(StringData data)
     if (contains_invalids(data)) {
         std::string encode_buffer;
         encode_buffer.resize(util::base64_encoded_size(len));
-        util::base64_encode(start, len, encode_buffer.data(), encode_buffer.size());
+        util::base64_encode(data, encode_buffer);
         out = "B64\"" + encode_buffer + "\"";
     }
     else {
@@ -410,7 +410,7 @@ std::string SerialisationState::describe_column(ConstTableRef table, ColKey col_
 std::string SerialisationState::get_backlink_column_name(ConstTableRef from, ColKey col_key)
 {
     ColumnType col_type = col_key.get_type();
-    REALM_ASSERT_EX(col_type == col_type_Link || col_type == col_type_LinkList, col_type);
+    REALM_ASSERT_EX(col_type == col_type_Link, col_type);
 
     auto target_table = from->get_opposite_table(col_key);
     auto backlink_col = from->get_opposite_column(col_key);

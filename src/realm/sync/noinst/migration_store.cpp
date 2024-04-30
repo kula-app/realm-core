@@ -16,22 +16,14 @@ constexpr static std::string_view
     c_flx_migration_sentinel_subscription_set_version("sentinel_subscription_set_version");
 constexpr static std::string_view c_flx_subscription_name_prefix("flx_migrated_");
 
-class MigrationStoreInit : public MigrationStore {
-public:
-    explicit MigrationStoreInit(DBRef db)
-        : MigrationStore(std::move(db))
-    {
-    }
-};
-
 } // namespace
 
 MigrationStoreRef MigrationStore::create(DBRef db)
 {
-    return std::make_shared<MigrationStoreInit>(std::move(db));
+    return std::make_shared<MigrationStore>(Private(), std::move(db));
 }
 
-MigrationStore::MigrationStore(DBRef db)
+MigrationStore::MigrationStore(Private, DBRef db)
     : m_db(std::move(db))
     , m_state(MigrationState::NotMigrated)
 {
@@ -83,7 +75,8 @@ bool MigrationStore::load_data(bool read_only)
     // Load the metadata schema unless it was just created
     if (!m_migration_table) {
         if (*schema_version != c_schema_version) {
-            throw std::runtime_error("Invalid schema version for flexible sync migration store metadata");
+            throw RuntimeError(ErrorCodes::UnsupportedFileFormatVersion,
+                               "Invalid schema version for flexible sync migration store metadata");
         }
         load_sync_metadata_schema(tr, &internal_tables);
     }
@@ -304,7 +297,7 @@ Subscription MigrationStore::make_subscription(const std::string& object_class_n
     return Subscription{subscription_name, object_class_name, rql_query_string};
 }
 
-void MigrationStore::create_subscriptions(const SubscriptionStore& subs_store)
+void MigrationStore::create_subscriptions(SubscriptionStore& subs_store)
 {
     std::unique_lock lock{m_mutex};
     if (m_state != MigrationState::Migrated) {
@@ -315,7 +308,7 @@ void MigrationStore::create_subscriptions(const SubscriptionStore& subs_store)
     create_subscriptions(subs_store, *m_query_string);
 }
 
-void MigrationStore::create_subscriptions(const SubscriptionStore& subs_store, const std::string& rql_query_string)
+void MigrationStore::create_subscriptions(SubscriptionStore& subs_store, const std::string& rql_query_string)
 {
     if (rql_query_string.empty()) {
         return;
@@ -330,7 +323,7 @@ void MigrationStore::create_subscriptions(const SubscriptionStore& subs_store, c
 
     // List of tables in the realm.
     auto table_keys = tr->get_table_keys();
-    for (const auto& key : table_keys) {
+    for (auto key : table_keys) {
         if (!tr->table_is_public(key)) {
             continue;
         }
@@ -354,7 +347,7 @@ void MigrationStore::create_subscriptions(const SubscriptionStore& subs_store, c
     mut_sub.commit();
 }
 
-void MigrationStore::create_sentinel_subscription_set(const SubscriptionStore& subs_store)
+void MigrationStore::create_sentinel_subscription_set(SubscriptionStore& subs_store)
 {
     std::lock_guard lock{m_mutex};
     if (m_state != MigrationState::Migrated) {

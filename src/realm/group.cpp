@@ -27,7 +27,6 @@
 
 #include <realm/util/file_mapper.hpp>
 #include <realm/util/memory_stream.hpp>
-#include <realm/util/miscellaneous.hpp>
 #include <realm/util/thread.hpp>
 #include <realm/impl/destroy_guard.hpp>
 #include <realm/utilities.hpp>
@@ -76,7 +75,6 @@ Group::Group(const std::string& file_path, const char* encryption_key)
     , m_top(m_alloc)
     , m_tables(m_alloc)
     , m_table_names(m_alloc)
-    , m_total_rows(0)
 {
     init_array_parents();
 
@@ -99,7 +97,6 @@ Group::Group(BinaryData buffer, bool take_ownership)
     , m_top(m_alloc)
     , m_tables(m_alloc)
     , m_table_names(m_alloc)
-    , m_total_rows(0)
 {
     REALM_ASSERT(buffer.data());
 
@@ -118,7 +115,6 @@ Group::Group(SlabAlloc* alloc) noexcept
     m_top(m_alloc)
     , m_tables(m_alloc)
     , m_table_names(m_alloc)
-    , m_total_rows(0)
 {
     init_array_parents();
 }
@@ -329,7 +325,7 @@ int Group::get_target_file_format_version_for_session(int current_file_format_ve
     // individual file format versions.
 
     if (requested_history_type == Replication::hist_None) {
-        if (current_file_format_version == 23) {
+        if (current_file_format_version == 24) {
             // We are able to open these file formats in RO mode
             return current_file_format_version;
         }
@@ -382,6 +378,28 @@ uint64_t Group::get_sync_file_id() const noexcept
     auto repl = get_replication();
     if (repl && repl->get_history_type() == Replication::hist_SyncServer) {
         return 1;
+    }
+    return 0;
+}
+
+size_t Group::get_free_space_size(const Array& top) noexcept
+{
+    if (top.is_attached() && top.size() > s_free_size_ndx) {
+        auto ref = top.get_as_ref(s_free_size_ndx);
+        Array free_list_sizes(top.get_alloc());
+        free_list_sizes.init_from_ref(ref);
+        return size_t(free_list_sizes.get_sum());
+    }
+    return 0;
+}
+
+size_t Group::get_history_size(const Array& top) noexcept
+{
+    if (top.is_attached() && top.size() > s_hist_ref_ndx) {
+        auto ref = top.get_as_ref(s_hist_ref_ndx);
+        Array hist(top.get_alloc());
+        hist.init_from_ref(ref);
+        return hist.get_byte_size_deep();
     }
     return 0;
 }
@@ -560,9 +578,6 @@ void Group::attach(ref_type top_ref, bool writable, bool create_group_when_missi
     while (m_table_accessors.size() < sz) {
         m_table_accessors.emplace_back();
     }
-#if REALM_METRICS
-    update_num_objects();
-#endif // REALM_METRICS
 }
 
 
@@ -576,23 +591,6 @@ void Group::detach() noexcept
     m_top.detach();
 
     m_attached = false;
-}
-
-void Group::update_num_objects()
-{
-#if REALM_METRICS
-    if (m_metrics) {
-        // This is quite invasive and completely defeats the lazy loading mechanism
-        // where table accessors are only instantiated on demand, because they are all created here.
-
-        m_total_rows = 0;
-        auto keys = get_table_keys();
-        for (auto key : keys) {
-            ConstTableRef t = get_table(key);
-            m_total_rows += t->size();
-        }
-    }
-#endif // REALM_METRICS
 }
 
 void Group::attach_shared(ref_type new_top_ref, size_t new_file_size, bool writable, VersionID version)
@@ -752,7 +750,6 @@ Table* Group::do_add_table(StringData name, Table::Type table_type, bool do_repl
     return table;
 }
 
-
 Table* Group::create_table_accessor(size_t table_ndx)
 {
     REALM_ASSERT(m_tables.size() == m_table_accessors.size());
@@ -842,16 +839,13 @@ void Group::remove_table(size_t table_ndx, TableKey key)
         // We don't want to replicate the individual column removals along the
         // way as they're covered by the table removal
         Table::DisableReplication dr(*table);
-        for (size_t i = table->get_column_count(); i > 0; --i) {
-            ColKey col_key = table->spec_ndx2colkey(i - 1);
-            table->remove_column(col_key);
-        }
+        table->remove_columns();
     }
 
     size_t prior_num_tables = m_tables.size();
     Replication* repl = *get_repl();
     if (repl)
-        repl->erase_class(key, prior_num_tables); // Throws
+        repl->erase_class(key, table->get_name(), prior_num_tables); // Throws
 
     int64_t ref_64 = m_tables.get(table_ndx);
     REALM_ASSERT(!int_cast_has_overflow<ref_type>(ref_64));
@@ -991,10 +985,14 @@ void Group::write(File& file, const char* encryption_key, uint_fast64_t version_
 
     file.set_encryption_key(encryption_key);
 
+    // Force the file system to allocate a node so we get a stable unique id.
+    // See File::get_unique_id(). This is used to distinguish encrypted mappings.
+    file.resize(1);
+
     // The aim is that the buffer size should be at least 1/256 of needed size but less than 64 Mb
     constexpr size_t upper_bound = 64 * 1024 * 1024;
     size_t min_space = std::min(get_used_space() >> 8, upper_bound);
-    size_t buffer_size = 4096;
+    size_t buffer_size = page_size();
     while (buffer_size < min_space) {
         buffer_size <<= 1;
     }
@@ -1203,68 +1201,6 @@ bool Group::operator==(const Group& g) const
     }
     return true;
 }
-void Group::schema_to_json(std::ostream& out, std::map<std::string, std::string>* opt_renames) const
-{
-    check_attached();
-
-    std::map<std::string, std::string> renames;
-    if (opt_renames) {
-        renames = *opt_renames;
-    }
-
-    out << "[" << std::endl;
-
-    auto keys = get_table_keys();
-    int sz = int(keys.size());
-    for (int i = 0; i < sz; ++i) {
-        auto key = keys[i];
-        ConstTableRef table = get_table(key);
-
-        table->schema_to_json(out, renames);
-        if (i < sz - 1)
-            out << ",";
-        out << std::endl;
-    }
-
-    out << "]" << std::endl;
-}
-
-void Group::to_json(std::ostream& out, size_t link_depth, std::map<std::string, std::string>* opt_renames,
-                    JSONOutputMode output_mode) const
-{
-    check_attached();
-
-    std::map<std::string, std::string> renames;
-    if (opt_renames) {
-        renames = *opt_renames;
-    }
-
-    out << "{" << std::endl;
-
-    auto keys = get_table_keys();
-    bool first = true;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = keys[i];
-        StringData name = get_table_name(key);
-        if (renames[name] != "")
-            name = renames[name];
-
-        ConstTableRef table = get_table(key);
-
-        if (!table->is_embedded()) {
-            if (!first)
-                out << ",";
-            out << "\"" << name << "\"";
-            out << ":";
-            table->to_json(out, link_depth, renames, output_mode);
-            out << std::endl;
-            first = false;
-        }
-    }
-
-    out << "}" << std::endl;
-}
-
 size_t Group::get_used_space() const noexcept
 {
     if (!m_top.is_attached())
@@ -1750,7 +1686,6 @@ MemStats Group::get_stats()
 
     return mem_stats;
 }
-
 
 void Group::print() const
 {

@@ -16,18 +16,24 @@
  *
  **************************************************************************/
 
-#include <climits>
-#include <limits>
-#include <algorithm>
-#include <vector>
+#include <realm/util/file.hpp>
 
+#include <realm/unicode.hpp>
+#include <realm/util/errno.hpp>
+#include <realm/util/file_mapper.hpp>
+
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
-#include <cstring>
+#include <climits>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
-#include <iostream>
+#include <cstring>
 #include <fcntl.h>
+#include <iostream>
+#include <limits>
+#include <vector>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -36,17 +42,15 @@
 #include <sys/statvfs.h>
 #endif
 
-#include <realm/exceptions.hpp>
-#include <realm/unicode.hpp>
-#include <realm/util/errno.hpp>
-#include <realm/util/file_mapper.hpp>
-#include <realm/util/safe_int_ops.hpp>
-#include <realm/util/features.h>
-#include <realm/util/file.hpp>
+#if REALM_PLATFORM_APPLE
+#include <sys/attr.h>
+#include <sys/clonefile.h>
+#endif
 
 using namespace realm::util;
 
 namespace {
+constexpr size_t c_min_supported_page_size = 4096;
 size_t get_page_size()
 {
 #ifdef _WIN32
@@ -58,13 +62,13 @@ size_t get_page_size()
 #else
     long size = sysconf(_SC_PAGESIZE);
 #endif
-    REALM_ASSERT(size > 0 && size % 4096 == 0);
+    REALM_ASSERT(size > 0 && size % c_min_supported_page_size == 0);
     return static_cast<size_t>(size);
 }
 
 // This variable exists such that page_size() can return the page size without having to make any system calls.
 // It could also have been a static local variable, but Valgrind/Helgrind gives a false error on that.
-size_t cached_page_size = get_page_size();
+std::atomic<size_t> cached_page_size = get_page_size();
 
 bool for_each_helper(const std::string& path, const std::string& dir, realm::util::File::ForEachHandler& handler)
 {
@@ -247,9 +251,13 @@ void make_dir_recursive(std::string path)
             path[sep] = 0;
         }
         try_make_dir(path);
-        if (sep < path.size())
+        if (c) {
             path[sep] = c;
-        pos = sep + 1;
+            pos = sep + 1;
+        }
+        else {
+            break;
+        }
     }
 #endif
 }
@@ -389,31 +397,40 @@ std::string make_temp_file(const char* prefix)
     char* tmp_dir_env = getenv("TMPDIR");
     std::string base_dir = tmp_dir_env ? tmp_dir_env : std::string(P_tmpdir);
     if (!base_dir.empty() && base_dir[base_dir.length() - 1] != '/') {
-        base_dir = base_dir + "/";
+        base_dir += '/';
     }
 #endif
-    std::string tmp = base_dir + prefix + std::string("_XXXXXX") + std::string("\0", 1);
-    std::unique_ptr<char[]> buffer = std::make_unique<char[]>(tmp.size()); // Throws
-    memcpy(buffer.get(), tmp.c_str(), tmp.size());
-    char* filename = buffer.get();
-    auto fd = mkstemp(filename);
+    std::string filename = util::format("%1%2_XXXXXX", base_dir, prefix);
+    auto fd = mkstemp(filename.data());
     if (fd == -1) {
         throw std::system_error(errno, std::system_category(), "mkstemp() failed"); // LCOV_EXCL_LINE
     }
     close(fd);
-    return std::string(filename);
+    return filename;
 #endif
 }
 
 size_t page_size()
 {
-    return cached_page_size;
+    return cached_page_size.load(std::memory_order::memory_order_relaxed);
+}
+
+OnlyForTestingPageSizeChange::OnlyForTestingPageSizeChange(size_t new_page_size)
+{
+    REALM_ASSERT(new_page_size % c_min_supported_page_size == 0);
+    cached_page_size = new_page_size;
+}
+
+OnlyForTestingPageSizeChange::~OnlyForTestingPageSizeChange()
+{
+    cached_page_size = get_page_size();
 }
 
 void File::open_internal(const std::string& path, AccessMode a, CreateMode c, int flags, bool* success)
 {
     REALM_ASSERT_RELEASE(!is_attached());
     m_path = path; // for error reporting and debugging
+    m_cached_unique_id = {};
 
 #ifdef _WIN32 // Windows version
 
@@ -569,6 +586,32 @@ void File::close() noexcept
     REALM_ASSERT_RELEASE(r == 0);
     m_fd = -1;
 
+#endif
+}
+
+void File::close_static(FileDesc fd)
+{
+#ifdef _WIN32
+    if (!fd)
+        return;
+
+    if (!CloseHandle(fd))
+        throw std::system_error(GetLastError(), std::system_category(),
+                                "CloseHandle() failed from File::close_static()");
+#else
+    if (fd < 0)
+        return;
+
+    int ret = -1;
+    do {
+        ret = ::close(fd);
+    } while (ret == -1 && errno == EINTR);
+
+    if (ret != 0) {
+        int err = errno; // Eliminate any risk of clobbering
+        if (err == EBADF || err == EIO)
+            throw SystemError(err, "File::close_static() failed");
+    }
 #endif
 }
 
@@ -880,7 +923,7 @@ void File::prealloc(size_t size)
 #endif
     };
 
-#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L // POSIX.1-2001 version
+#if REALM_HAVE_POSIX_FALLOCATE
     // Mostly Linux only
     if (!prealloc_if_supported(0, new_size)) {
         consume_space_interlocked();
@@ -954,7 +997,7 @@ void File::prealloc(size_t size)
 #error Please check if/how your OS supports file preallocation
 #endif
 
-#endif // !(_POSIX_C_SOURCE >= 200112L)
+#endif // REALM_HAVE_POSIX_FALLOCATE
 }
 
 
@@ -962,7 +1005,7 @@ bool File::prealloc_if_supported(SizeType offset, size_t size)
 {
     REALM_ASSERT_RELEASE(is_attached());
 
-#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L // POSIX.1-2001 version
+#if REALM_HAVE_POSIX_FALLOCATE
 
     REALM_ASSERT_RELEASE(is_prealloc_supported());
 
@@ -983,7 +1026,7 @@ bool File::prealloc_if_supported(SizeType offset, size_t size)
         return true;
     }
 
-    if (status == EINVAL || status == EPERM) {
+    if (status == EINVAL || status == EPERM || status == EOPNOTSUPP) {
         return false; // Retry with non-atomic version
     }
 
@@ -1015,7 +1058,7 @@ bool File::prealloc_if_supported(SizeType offset, size_t size)
 
 bool File::is_prealloc_supported()
 {
-#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L // POSIX.1-2001 version
+#if REALM_HAVE_POSIX_FALLOCATE
     return true;
 #else
     return false;
@@ -1518,22 +1561,41 @@ void File::move(const std::string& old_path, const std::string& new_path)
 }
 
 
-void File::copy(const std::string& origin_path, const std::string& target_path)
+bool File::copy(const std::string& origin_path, const std::string& target_path, bool overwrite_existing)
 {
 #if REALM_HAVE_STD_FILESYSTEM
-    std::filesystem::copy_file(u8path(origin_path), u8path(target_path),
-                               std::filesystem::copy_options::overwrite_existing); // Throws
+    auto options = overwrite_existing ? std::filesystem::copy_options::overwrite_existing
+                                      : std::filesystem::copy_options::skip_existing;
+    return std::filesystem::copy_file(u8path(origin_path), u8path(target_path), options); // Throws
 #else
-    File origin_file{origin_path, mode_Read};  // Throws
-    File target_file{target_path, mode_Write}; // Throws
+#if REALM_PLATFORM_APPLE
+    // Try to use clonefile and fall back to manual copying if it fails
+    if (clonefile(origin_path.c_str(), target_path.c_str(), 0) == 0) {
+        return true;
+    }
+    if (errno == EEXIST && !overwrite_existing) {
+        return false;
+    }
+#endif
+
+    File origin_file{origin_path, mode_Read}; // Throws
+    File target_file;
+    bool did_create = false;
+    target_file.open(target_path, did_create); // Throws
+    if (!did_create && !overwrite_existing) {
+        return false;
+    }
+
     size_t buffer_size = 4096;
-    std::unique_ptr<char[]> buffer = std::make_unique<char[]>(buffer_size); // Throws
+    auto buffer = std::make_unique<char[]>(buffer_size); // Throws
     for (;;) {
         size_t n = origin_file.read(buffer.get(), buffer_size); // Throws
         target_file.write(buffer.get(), n);                     // Throws
         if (n < buffer_size)
             break;
     }
+
+    return true;
 #endif
 }
 
@@ -1558,22 +1620,50 @@ bool File::compare(const std::string& path_1, const std::string& path_2)
     return true;
 }
 
-bool File::is_same_file_static(FileDesc f1, FileDesc f2)
+bool File::is_same_file_static(FileDesc f1, FileDesc f2, const std::string& path1, const std::string& path2)
 {
-    return get_unique_id(f1) == get_unique_id(f2);
+    return get_unique_id(f1, path1) == get_unique_id(f2, path2);
 }
 
 bool File::is_same_file(const File& f) const
 {
     REALM_ASSERT_RELEASE(is_attached());
     REALM_ASSERT_RELEASE(f.is_attached());
-    return is_same_file_static(m_fd, f.m_fd);
+    return is_same_file_static(m_fd, f.m_fd, m_path, f.m_path);
 }
 
-File::UniqueID File::get_unique_id() const
+FileDesc File::dup_file_desc(FileDesc fd)
+{
+    FileDesc fd_duped;
+#ifdef _WIN32
+    if (!DuplicateHandle(GetCurrentProcess(), fd, GetCurrentProcess(), &fd_duped, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        throw std::system_error(GetLastError(), std::system_category(), "DuplicateHandle() failed");
+#else
+    fd_duped = dup(fd);
+
+    if (fd_duped == -1) {
+        int err = errno; // Eliminate any risk of clobbering
+        throw std::system_error(err, std::system_category(), "dup() failed");
+    }
+#endif // conditonal on _WIN32
+    return fd_duped;
+}
+
+File::UniqueID File::get_unique_id()
 {
     REALM_ASSERT_RELEASE(is_attached());
-    return File::get_unique_id(m_fd);
+    File::UniqueID uid = File::get_unique_id(m_fd, m_path);
+    if (!m_cached_unique_id) {
+        m_cached_unique_id = std::make_optional(uid);
+    }
+    if (m_cached_unique_id != uid) {
+        throw FileAccessError(ErrorCodes::FileOperationFailed,
+                              util::format("The unique id of this Realm file has changed unexpectedly, this could be "
+                                           "due to modifications by an external process '%1'",
+                                           m_path),
+                              m_path);
+    }
+    return uid;
 }
 
 FileDesc File::get_descriptor() const
@@ -1597,27 +1687,36 @@ std::optional<File::UniqueID> File::get_unique_id(const std::string& path)
         throw SystemError(GetLastError(), "CreateFileW failed");
     }
 
-    return get_unique_id(fileHandle);
+    return get_unique_id(fileHandle, path);
 #else // POSIX version
     struct stat statbuf;
     if (::stat(path.c_str(), &statbuf) == 0) {
+        if (statbuf.st_size == 0) {
+            // On exFAT systems the inode and device are not populated correctly until the file
+            // has been allocated some space. The uid can also be reassigned if the file is
+            // truncated to zero. This has led to bugs where a unique id returned here was
+            // reused by different files. The following check ensures that this is not
+            // happening anywhere else in future code.
+            return none;
+        }
         return File::UniqueID(statbuf.st_dev, statbuf.st_ino);
     }
     int err = errno; // Eliminate any risk of clobbering
     // File doesn't exist
     if (err == ENOENT)
         return none;
-    throw SystemError(err, format_errno("fstat() failed: %1", err));
+    throw SystemError(err, format_errno("fstat() failed: %1 for '%2'", err, path));
 #endif
 }
 
-File::UniqueID File::get_unique_id(FileDesc file)
+File::UniqueID File::get_unique_id(FileDesc file, const std::string& debug_path)
 {
 #ifdef _WIN32 // Windows version
     REALM_ASSERT(file != nullptr);
     File::UniqueID ret;
     if (GetFileInformationByHandleEx(file, FileIdInfo, &ret.id_info, sizeof(ret.id_info)) == 0) {
-        throw std::system_error(GetLastError(), std::system_category(), "GetFileInformationByHandleEx() failed");
+        throw std::system_error(GetLastError(), std::system_category(),
+                                util::format("GetFileInformationByHandleEx() failed for '%1'", debug_path));
     }
 
     return ret;
@@ -1625,9 +1724,22 @@ File::UniqueID File::get_unique_id(FileDesc file)
     REALM_ASSERT(file >= 0);
     struct stat statbuf;
     if (::fstat(file, &statbuf) == 0) {
+        // On exFAT systems the inode and device are not populated correctly until the file
+        // has been allocated some space. The uid can also be reassigned if the file is
+        // truncated to zero. This has led to bugs where a unique id returned here was
+        // reused by different files. The following check ensures that this is not
+        // happening anywhere else in future code.
+        if (statbuf.st_size == 0) {
+            throw FileAccessError(
+                ErrorCodes::FileOperationFailed,
+                util::format("Attempt to get unique id on an empty file. This could be due to an external "
+                             "process modifying Realm files. '%1'",
+                             debug_path),
+                debug_path);
+        }
         return UniqueID(statbuf.st_dev, statbuf.st_ino);
     }
-    throw std::system_error(errno, std::system_category(), "fstat() failed");
+    throw std::system_error(errno, std::system_category(), util::format("fstat() failed for '%1'", debug_path));
 #endif
 }
 

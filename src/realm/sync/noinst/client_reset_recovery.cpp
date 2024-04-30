@@ -22,24 +22,204 @@
 #include <realm/dictionary.hpp>
 #include <realm/object_converter.hpp>
 #include <realm/set.hpp>
-#include <realm/transaction.hpp>
-
-#include <realm/sync/history.hpp>
 #include <realm/sync/changeset_parser.hpp>
-#include <realm/sync/noinst/client_history_impl.hpp>
+#include <realm/sync/history.hpp>
+#include <realm/sync/instruction_applier.hpp>
 #include <realm/sync/noinst/client_reset.hpp>
+#include <realm/sync/protocol.hpp>
 #include <realm/sync/subscriptions.hpp>
-
+#include <realm/sync/subscriptions.hpp>
 #include <realm/util/compression.hpp>
+#include <realm/util/flat_map.hpp>
+#include <realm/util/optional.hpp>
 
 #include <algorithm>
 #include <vector>
 
 using namespace realm;
-using namespace _impl;
-using namespace sync;
+using namespace realm::_impl;
+using namespace realm::sync;
 
-namespace realm::_impl::client_reset {
+namespace {
+
+// State tracking of operations on list indices. All list operations in a recovered changeset
+// must apply to a "known" index. An index is known if the element at that position was added
+// by the recovery itself. If any operation applies to an "unknown" index, the list will go into
+// a requires_manual_copy state which means that all further operations on the list are ignored
+// and the entire list is copied over verbatim at the end.
+struct ListTracker {
+    struct CrossListIndex {
+        uint32_t local;
+        uint32_t remote;
+    };
+
+    util::Optional<CrossListIndex> insert(uint32_t local_index, size_t remote_list_size);
+    util::Optional<CrossListIndex> update(uint32_t index);
+    void clear();
+    bool move(uint32_t from, uint32_t to, size_t lst_size, uint32_t& remote_from_out, uint32_t& remote_to_out);
+    bool remove(uint32_t index, uint32_t& remote_index_out);
+    bool requires_manual_copy() const;
+    void queue_for_manual_copy();
+    void mark_as_copied();
+
+private:
+    std::vector<CrossListIndex> m_indices_allowed;
+    bool m_requires_manual_copy = false;
+    bool m_has_been_copied = false;
+};
+
+struct InternDictKey {
+    bool is_null() const
+    {
+        return m_pos == realm::npos && m_size == realm::npos;
+    }
+    constexpr bool operator==(const InternDictKey& other) const noexcept
+    {
+        return m_pos == other.m_pos && m_size == other.m_size;
+    }
+    constexpr bool operator!=(const InternDictKey& other) const noexcept
+    {
+        return !operator==(other);
+    }
+    constexpr bool operator<(const InternDictKey& other) const noexcept
+    {
+        if (m_pos < other.m_pos) {
+            return true;
+        }
+        else if (m_pos == other.m_pos) {
+            return m_size < other.m_size;
+        }
+        return false;
+    }
+
+private:
+    friend struct InterningBuffer;
+    size_t m_pos = realm::npos;
+    size_t m_size = realm::npos;
+};
+
+struct InterningBuffer {
+    std::string_view get_key(const InternDictKey& key) const;
+    InternDictKey get_or_add(const std::string_view& str);
+
+private:
+    std::string m_dict_keys_buffer;
+    std::vector<InternDictKey> m_dict_keys;
+};
+
+// A wrapper around a PathInstruction which enables storing this path in a
+// FlatMap or other container. The advantage of using this instead of a PathInstruction
+// is the use of ColKey instead of column names and that because it is not possible to use
+// the InternStrings of a PathInstruction because they are tied to a specific Changeset,
+// while the ListPath can be used across multiple Changesets.
+struct ListPath {
+    ListPath(TableKey table_key, ObjKey obj_key);
+
+    struct Element {
+        explicit Element(const InternDictKey& str);
+        explicit Element(ColKey key);
+        union {
+            InternDictKey intern_key;
+            size_t index;
+            ColKey col_key;
+        };
+        enum class Type {
+            InternKey,
+            ListIndex,
+            ColumnKey,
+        } type;
+
+        bool operator==(const Element& other) const noexcept;
+        bool operator!=(const Element& other) const noexcept;
+        bool operator<(const Element& other) const noexcept;
+    };
+
+    void append(const Element& item);
+    bool operator<(const ListPath& other) const noexcept;
+    bool operator==(const ListPath& other) const noexcept;
+    bool operator!=(const ListPath& other) const noexcept;
+    std::string path_to_string(Transaction& remote, const InterningBuffer& buffer);
+
+    using const_iterator = typename std::vector<Element>::const_iterator;
+    using iterator = typename std::vector<Element>::iterator;
+    const_iterator begin() const noexcept
+    {
+        return m_path.begin();
+    }
+    const_iterator end() const noexcept
+    {
+        return m_path.end();
+    }
+    TableKey table_key() const noexcept
+    {
+        return m_table_key;
+    }
+    ObjKey obj_key() const noexcept
+    {
+        return m_obj_key;
+    }
+
+private:
+    std::vector<Element> m_path;
+    TableKey m_table_key;
+    ObjKey m_obj_key;
+};
+
+struct RecoverLocalChangesetsHandler : public sync::InstructionApplier {
+    RecoverLocalChangesetsHandler(Transaction& dest_wt, Transaction& frozen_pre_local_state, util::Logger& logger);
+    util::AppendBuffer<char> process_changeset(const ChunkedBinaryData& changeset);
+
+private:
+    using Instruction = sync::Instruction;
+    using ListPathCallback = util::UniqueFunction<bool(LstBase&, uint32_t, const ListPath&)>;
+
+    struct RecoveryResolver : public InstructionApplier::PathResolver {
+        RecoveryResolver(RecoverLocalChangesetsHandler* applier, Instruction::PathInstruction& instr,
+                         const std::string_view& instr_name);
+        void on_property(Obj&, ColKey) override;
+        void on_list(LstBase&) override;
+        Status on_list_index(LstBase&, uint32_t) override;
+        void on_dictionary(Dictionary&) override;
+        Status on_dictionary_key(Dictionary&, Mixed) override;
+        void on_set(SetBase&) override;
+        void on_error(const std::string&) override;
+        void on_column_advance(ColKey) override;
+        void on_dict_key_advance(StringData) override;
+        Status on_list_index_advance(uint32_t) override;
+        Status on_null_link_advance(StringData, StringData) override;
+        Status on_begin(const util::Optional<Obj>&) override;
+        void on_finish() override {}
+
+        void set_last_path_index(uint32_t ndx);
+
+        ListPath m_list_path;
+        Instruction::PathInstruction& m_mutable_instr;
+        RecoverLocalChangesetsHandler* m_recovery_applier;
+    };
+
+    REALM_NORETURN void handle_error(const std::string& message) const;
+    void copy_lists_with_unrecoverable_changes();
+
+    bool resolve_path(ListPath& path, Obj remote_obj, Obj local_obj,
+                      util::UniqueFunction<void(LstBase&, LstBase&)> callback);
+    bool resolve(ListPath& path, util::UniqueFunction<void(LstBase&, LstBase&)> callback);
+
+#define REALM_DECLARE_INSTRUCTION_HANDLER(X) void operator()(const Instruction::X&) override;
+    REALM_FOR_EACH_INSTRUCTION_TYPE(REALM_DECLARE_INSTRUCTION_HANDLER)
+#undef REALM_DECLARE_INSTRUCTION_HANDLER
+    friend struct sync::Instruction; // to allow visitor
+
+private:
+    Transaction& m_frozen_pre_local_state;
+    // Keeping the member variable reference to a logger since the lifetime of this class is
+    // only within the function that created it.
+    util::Logger& m_logger;
+    InterningBuffer m_intern_keys;
+    // Track any recovered operations on lists to make sure that they are allowed.
+    // If not, the lists here will be copied verbatim from the local state to the remote.
+    util::FlatMap<ListPath, ListTracker> m_lists;
+    Replication* m_replication;
+};
 
 util::Optional<ListTracker::CrossListIndex> ListTracker::insert(uint32_t local_index, size_t remote_list_size)
 {
@@ -176,13 +356,19 @@ bool ListTracker::remove(uint32_t index, uint32_t& remote_index_out)
 
 bool ListTracker::requires_manual_copy() const
 {
-    return m_requires_manual_copy;
+    // We only ever need to copy a list once as we go straight to the final state
+    return m_requires_manual_copy && !m_has_been_copied;
 }
 
 void ListTracker::queue_for_manual_copy()
 {
     m_requires_manual_copy = true;
     m_indices_allowed.clear();
+}
+
+void ListTracker::mark_as_copied()
+{
+    m_has_been_copied = true;
 }
 
 std::string_view InterningBuffer::get_key(const InternDictKey& key) const
@@ -218,33 +404,6 @@ InternDictKey InterningBuffer::get_or_add(const std::string_view& str)
         m_dict_keys.push_back(new_key);
     }
     return new_key;
-}
-
-InternDictKey InterningBuffer::get_interned_key(const std::string_view& str) const
-{
-    if (str.data() == nullptr) {
-        return {};
-    }
-    for (auto& key : m_dict_keys) {
-        StringData existing = get_key(key);
-        if (existing == str) {
-            return key;
-        }
-    }
-    throw std::runtime_error(
-        util::format("InterningBuffer::get_interned_key(%1) did not contain the requested key", str));
-    return {};
-}
-
-std::string InterningBuffer::print() const
-{
-    return util::format("InterningBuffer of size=%1:'%2'", m_dict_keys.size(), m_dict_keys_buffer);
-}
-
-ListPath::Element::Element(size_t stable_ndx)
-    : index(stable_ndx)
-    , type(Type::ListIndex)
-{
 }
 
 ListPath::Element::Element(const InternDictKey& str)
@@ -364,97 +523,61 @@ std::string ListPath::path_to_string(Transaction& remote, const InterningBuffer&
 
 RecoverLocalChangesetsHandler::RecoverLocalChangesetsHandler(Transaction& dest_wt,
                                                              Transaction& frozen_pre_local_state,
-                                                             util::Logger& logger, Replication* repl)
+                                                             util::Logger& logger)
     : InstructionApplier(dest_wt)
     , m_frozen_pre_local_state{frozen_pre_local_state}
     , m_logger{logger}
-    , m_replication{repl}
+    , m_replication{dest_wt.get_replication()}
 {
 }
-
-RecoverLocalChangesetsHandler::~RecoverLocalChangesetsHandler() {}
 
 REALM_NORETURN void RecoverLocalChangesetsHandler::handle_error(const std::string& message) const
 {
     std::string full_message =
         util::format("Unable to automatically recover local changes during client reset: '%1'", message);
-    m_logger.error(full_message.c_str());
+    m_logger.error(util::LogCategory::reset, full_message.c_str());
     throw realm::_impl::client_reset::ClientResetFailed(full_message);
 }
 
-void RecoverLocalChangesetsHandler::process_changesets(const std::vector<ClientHistory::LocalChange>& changesets,
-                                                       std::vector<sync::SubscriptionSet>&& pending_subscriptions)
+util::AppendBuffer<char> RecoverLocalChangesetsHandler::process_changeset(const ChunkedBinaryData& changeset)
 {
-    // When recovering in PBS, we can iterate through all the changes and apply them in a single commit.
-    // This has the nice property that any exception while applying will revert the entire recovery and leave
-    // the Realm in a "pre reset" state.
-    //
-    // When recovering in FLX mode, we must apply subscription sets interleaved between the correct commits.
-    // This handles the case where some objects were subscribed to for only one commit and then unsubscribed after.
+    ChunkedBinaryInputStream in{changeset};
+    size_t decompressed_size;
+    auto decompressed = util::compression::decompress_nonportable_input_stream(in, decompressed_size);
+    if (!decompressed)
+        return {};
 
-    size_t subscription_index = 0;
-    auto write_pending_subscriptions_up_to = [&](version_type version) {
-        while (subscription_index < pending_subscriptions.size() &&
-               pending_subscriptions[subscription_index].snapshot_version() <= version) {
-            if (m_transaction.get_transact_stage() == DB::TransactStage::transact_Writing) {
-                // List modifications may have happened on an object which we are only subscribed to
-                // for this commit so we need to apply them as we go.
-                copy_lists_with_unrecoverable_changes();
-                m_transaction.commit_and_continue_as_read();
-            }
-            auto pre_sub = pending_subscriptions[subscription_index++];
-            auto post_sub = pre_sub.make_mutable_copy().commit();
-            m_logger.info("Recovering pending subscription version: %1 -> %2, snapshot: %3 -> %4", pre_sub.version(),
-                          post_sub.version(), pre_sub.snapshot_version(), post_sub.snapshot_version());
-        }
-        if (m_transaction.get_transact_stage() != DB::TransactStage::transact_Writing) {
-            m_transaction.promote_to_write();
-        }
-    };
-
-    for (const ClientHistory::LocalChange& change : changesets) {
-        if (change.changeset.size() == 0)
-            continue;
-
-        ChunkedBinaryInputStream in{change.changeset};
-        size_t decompressed_size;
-        auto decompressed = util::compression::decompress_nonportable_input_stream(in, decompressed_size);
-        if (!decompressed)
-            continue;
-
-        write_pending_subscriptions_up_to(change.version);
-
-        sync::Changeset parsed_changeset;
-        sync::parse_changeset(*decompressed, parsed_changeset); // Throws
+    sync::Changeset parsed_changeset;
+    sync::parse_changeset(*decompressed, parsed_changeset); // Throws
 #if REALM_DEBUG
-        if (m_logger.would_log(util::Logger::Level::trace)) {
-            std::stringstream dumped_changeset;
-            parsed_changeset.print(dumped_changeset);
-            m_logger.trace("Recovering changeset: %1", dumped_changeset.str());
-        }
+    if (m_logger.would_log(util::Logger::Level::trace)) {
+        std::stringstream dumped_changeset;
+        parsed_changeset.print(dumped_changeset);
+        m_logger.trace(util::LogCategory::reset, "Recovering changeset: %1", dumped_changeset.str());
+    }
 #endif
 
-        InstructionApplier::begin_apply(parsed_changeset, &m_logger);
-        for (auto instr : parsed_changeset) {
-            if (!instr)
-                continue;
-            instr->visit(*this); // Throws
-        }
-        InstructionApplier::end_apply();
+    InstructionApplier::begin_apply(parsed_changeset);
+    for (auto instr : parsed_changeset) {
+        if (!instr)
+            continue;
+        instr->visit(*this); // Throws
     }
-
-    // write any remaining subscriptions
-    write_pending_subscriptions_up_to(std::numeric_limits<version_type>::max());
-    REALM_ASSERT_EX(subscription_index == pending_subscriptions.size(), subscription_index);
+    InstructionApplier::end_apply();
 
     copy_lists_with_unrecoverable_changes();
+
+    auto& repl = static_cast<ClientReplication&>(*m_replication);
+    auto buffer = repl.get_instruction_encoder().release();
+    repl.reset();
+    return buffer;
 }
 
 void RecoverLocalChangesetsHandler::copy_lists_with_unrecoverable_changes()
 {
     // Any modifications, moves or deletes to list elements which were not also created in the recovery
     // cannot be reliably applied because there is no way to know if the indices on the server have
-    // shifted without a reliable server side history. For these lists, create a consistant state by
+    // shifted without a reliable server side history. For these lists, create a consistent state by
     // copying over the entire list from the recovering client's state. This does create a "last recovery wins"
     // scenario for modifications to lists, but this is only a best effort.
     // For example, consider a list [A,B].
@@ -467,12 +590,12 @@ void RecoverLocalChangesetsHandler::copy_lists_with_unrecoverable_changes()
     // we would know where list elements ended up or if they were deleted by the server.
     using namespace realm::converters;
     EmbeddedObjectConverter embedded_object_tracker;
-    for (auto& it : m_lists) {
-        if (!it.second.requires_manual_copy())
+    for (auto& [path, tracker] : m_lists) {
+        if (!tracker.requires_manual_copy())
             continue;
 
-        std::string path_str = it.first.path_to_string(m_transaction, m_intern_keys);
-        bool did_translate = resolve(it.first, [&](LstBase& remote_list, LstBase& local_list) {
+        std::string path_str = path.path_to_string(m_transaction, m_intern_keys);
+        bool did_translate = resolve(path, [&](LstBase& remote_list, LstBase& local_list) {
             ConstTableRef local_table = local_list.get_table();
             ConstTableRef remote_table = remote_list.get_table();
             ColKey local_col_key = local_list.get_col_key();
@@ -481,20 +604,23 @@ void RecoverLocalChangesetsHandler::copy_lists_with_unrecoverable_changes()
             Obj remote_obj = remote_list.get_obj();
             InterRealmValueConverter value_converter(local_table, local_col_key, remote_table, remote_col_key,
                                                      &embedded_object_tracker);
-            m_logger.debug("Recovery overwrites list for '%1' size: %2 -> %3", path_str, remote_list.size(),
-                           local_list.size());
+            m_logger.debug(util::LogCategory::reset, "Recovery overwrites list for '%1' size: %2 -> %3", path_str,
+                           remote_list.size(), local_list.size());
             value_converter.copy_value(local_obj, remote_obj, nullptr);
             embedded_object_tracker.process_pending();
         });
-        if (!did_translate) {
+        if (did_translate) {
+            tracker.mark_as_copied();
+        }
+        else {
             // object no longer exists in the local state, ignore and continue
-            m_logger.warn("Discarding a list recovery made to an object which could not be resolved. "
+            m_logger.warn(util::LogCategory::reset,
+                          "Discarding a list recovery made to an object which could not be resolved. "
                           "remote_path='%1'",
                           path_str);
         }
     }
     embedded_object_tracker.process_pending();
-    m_lists.clear();
 }
 
 bool RecoverLocalChangesetsHandler::resolve_path(ListPath& path, Obj remote_obj, Obj local_obj,
@@ -508,10 +634,10 @@ bool RecoverLocalChangesetsHandler::resolve_path(ListPath& path, Obj remote_obj,
         ColKey col = it->col_key;
         REALM_ASSERT(col);
         if (col.is_list()) {
-            std::unique_ptr<LstBase> remote_list = get_list_from_path(remote_obj, col);
+            auto remote_list = get_list_from_path(remote_obj, col);
             ColKey local_col = local_obj.get_table()->get_column_key(remote_obj.get_table()->get_column_name(col));
             REALM_ASSERT(local_col);
-            std::unique_ptr<LstBase> local_list = get_list_from_path(local_obj, local_col);
+            auto local_list = get_list_from_path(local_obj, local_col);
             ++it;
             if (it == path.end()) {
                 callback(*remote_list, *local_list);
@@ -547,7 +673,46 @@ bool RecoverLocalChangesetsHandler::resolve_path(ListPath& path, Obj remote_obj,
                 return false;
             }
         }
-        else { // single link to embedded object
+        else if (col.get_type() == col_type_Mixed) {
+            StringData col_name = remote_obj.get_table()->get_column_name(col);
+            auto local_any = local_obj.get_any(col_name);
+            auto remote_any = remote_obj.get_any(col);
+
+            if (local_any.is_type(type_List) && remote_any.is_type(type_List)) {
+                ++it;
+                if (it == path.end()) {
+                    auto local_col = local_obj.get_table()->get_column_key(col_name);
+                    Lst<Mixed> local_list{local_obj, local_col};
+                    Lst<Mixed> remote_list{remote_obj, col};
+                    callback(remote_list, local_list);
+                    return true;
+                }
+                else {
+                    // same as above.
+                    REALM_UNREACHABLE();
+                }
+            }
+            else if (local_any.is_type(type_Dictionary) && remote_any.is_type(type_Dictionary)) {
+                ++it;
+                REALM_ASSERT(it != path.end());
+                REALM_ASSERT(it->type == ListPath::Element::Type::InternKey);
+                StringData col_name = remote_obj.get_table()->get_column_name(col);
+                auto local_col = local_obj.get_table()->get_column_key(col_name);
+                Dictionary remote_dict{remote_obj, col};
+                Dictionary local_dict{local_obj, local_col};
+                StringData dict_key = m_intern_keys.get_key(it->intern_key);
+                if (remote_dict.contains(dict_key) && local_dict.contains(dict_key)) {
+                    remote_obj = remote_dict.get_object(dict_key);
+                    local_obj = local_dict.get_object(dict_key);
+                    ++it;
+                }
+                else {
+                    return false;
+                }
+            }
+        }
+        else {
+            // single link to embedded object
             // Neither embedded object sets nor Mixed(TypedLink) to embedded objects are supported.
             REALM_ASSERT_EX(!col.is_collection(), col);
             REALM_ASSERT_EX(col.get_type() == col_type_Link, col);
@@ -668,6 +833,7 @@ RecoverLocalChangesetsHandler::RecoveryResolver::Status
 RecoverLocalChangesetsHandler::RecoveryResolver::on_null_link_advance(StringData table_name, StringData link_name)
 {
     m_recovery_applier->m_logger.warn(
+        util::LogCategory::reset,
         "Discarding a local %1 made to an embedded object which no longer exists along path '%2.%3'", m_instr_name,
         table_name, link_name);
     return Status::DidNotResolve; // discard this instruction as it operates over a null link
@@ -677,18 +843,12 @@ RecoverLocalChangesetsHandler::RecoveryResolver::Status
 RecoverLocalChangesetsHandler::RecoveryResolver::on_begin(const util::Optional<Obj>& obj)
 {
     if (!obj) {
-        m_recovery_applier->m_logger.warn("Cannot recover '%1' which operates on a deleted object", m_instr_name);
+        m_recovery_applier->m_logger.warn(util::LogCategory::reset,
+                                          "Cannot recover '%1' which operates on a deleted object", m_instr_name);
         return Status::DidNotResolve;
     }
     m_list_path = ListPath(obj->get_table()->get_key(), obj->get_key());
     return Status::Pending;
-}
-
-void RecoverLocalChangesetsHandler::RecoveryResolver::on_finish() {}
-
-ListPath& RecoverLocalChangesetsHandler::RecoveryResolver::list_path()
-{
-    return m_list_path;
 }
 
 void RecoverLocalChangesetsHandler::RecoveryResolver::set_last_path_index(uint32_t ndx)
@@ -699,8 +859,6 @@ void RecoverLocalChangesetsHandler::RecoveryResolver::set_last_path_index(uint32
     REALM_ASSERT(mpark::holds_alternative<uint32_t>(m_path_instr.path[distance]));
     m_mutable_instr.path[distance] = ndx;
 }
-
-RecoverLocalChangesetsHandler::RecoveryResolver::~RecoveryResolver() {}
 
 void RecoverLocalChangesetsHandler::operator()(const Instruction::AddTable& instr)
 {
@@ -798,7 +956,7 @@ void RecoverLocalChangesetsHandler::operator()(const Instruction::Update& instr)
     if (UpdateResolver(this, instr_copy, instr_name).resolve() == RecoveryResolver::Status::Success) {
         if (!check_links_exist(instr_copy.value)) {
             if (!allows_null_links(instr_copy, instr_name)) {
-                m_logger.warn("Discarding an update which links to a deleted object");
+                m_logger.warn(util::LogCategory::reset, "Discarding an update which links to a deleted object");
                 return;
             }
             instr_copy.value = {};
@@ -875,11 +1033,10 @@ void RecoverLocalChangesetsHandler::operator()(const Instruction::AddColumn& ins
     }
 }
 
-void RecoverLocalChangesetsHandler::operator()(const Instruction::EraseColumn& instr)
+void RecoverLocalChangesetsHandler::operator()(const Instruction::EraseColumn&)
 {
     // Destructive schema changes are not allowed by the resetting client.
-    static_cast<void>(instr);
-    handle_error(util::format("Properties cannot be erased during client reset recovery"));
+    handle_error("Properties cannot be erased during client reset recovery");
 }
 
 void RecoverLocalChangesetsHandler::operator()(const Instruction::ArrayInsert& instr)
@@ -910,7 +1067,7 @@ void RecoverLocalChangesetsHandler::operator()(const Instruction::ArrayInsert& i
 
     static constexpr std::string_view instr_name("ArrayInsert");
     if (!check_links_exist(instr.value)) {
-        m_logger.warn("Discarding %1 which links to a deleted object", instr_name);
+        m_logger.warn(util::LogCategory::reset, "Discarding %1 which links to a deleted object", instr_name);
         return;
     }
     Instruction::ArrayInsert instr_copy = instr;
@@ -995,7 +1152,7 @@ void RecoverLocalChangesetsHandler::operator()(const Instruction::SetInsert& ins
     };
     static constexpr std::string_view instr_name("SetInsert");
     if (!check_links_exist(instr.value)) {
-        m_logger.warn("Discarding a %1 which links to a deleted object", instr_name);
+        m_logger.warn(util::LogCategory::reset, "Discarding a %1 which links to a deleted object", instr_name);
         return;
     }
     Instruction::SetInsert instr_copy = instr;
@@ -1019,4 +1176,16 @@ void RecoverLocalChangesetsHandler::operator()(const Instruction::SetErase& inst
     }
 }
 
-} // namespace realm::_impl::client_reset
+} // anonymous namespace
+
+std::vector<client_reset::RecoveredChange>
+client_reset::process_recovered_changesets(Transaction& dest_tr, Transaction& pre_reset_state, util::Logger& logger,
+                                           const std::vector<sync::ClientHistory::LocalChange>& local_changes)
+{
+    RecoverLocalChangesetsHandler handler(dest_tr, pre_reset_state, logger);
+    std::vector<RecoveredChange> encoded;
+    for (auto& local_change : local_changes) {
+        encoded.push_back({handler.process_changeset(local_change.changeset), local_change.version});
+    }
+    return encoded;
+}

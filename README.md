@@ -1,3 +1,9 @@
+<p align="right">
+<a href='https://github.com/realm/realm-core/releases'><img src='https://img.shields.io/github/v/release/realm/realm-core' alt='Latest Release' /></a>
+<a href='https://coveralls.io/github/realm/realm-core'><img src='https://coveralls.io/repos/github/realm/realm-core/badge.svg' alt='Coverage Status' /></a>
+<a href='https://github.com/realm/realm-core'><img src='https://img.shields.io/github/license/realm/realm-core' alt='Source License' /></a>
+</p>
+
 ![Realm](doc/logo.png)
 
 Realm is a mobile database that runs directly inside phones, tablets or wearables - check out [realm.io](https://realm.io).
@@ -14,7 +20,7 @@ This repository holds the source code for the core database component used by al
 
 Realm Core is not in itself an "end-user" product with a publicly stable and supported API.
 
-Refer to the [Realm documentation](https://www.mongodb.com/docs/realm) for information about Realm and using the SDKs.
+Refer to the [Atlas Device SDK documentation](https://www.mongodb.com/docs/atlas/device-sdks/) for information about Realm and using the SDKs.
 
 ## Building Realm
 

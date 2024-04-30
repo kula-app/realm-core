@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.22.1)
 message(STATUS "CMake version: ${CMAKE_VERSION}")
 
 set(CMAKE_BUILD_TYPE Debug CACHE STRING "")
@@ -6,7 +6,7 @@ project(RealmCore)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/tools/cmake")
 
-if(NOT CMAKE_SOURCE_DIR STREQUAL ${CMAKE_CURRENT_SOURCE_DIR})
+if(NOT DEFINED REALM_CORE_SUBMODULE_BUILD AND NOT CMAKE_SOURCE_DIR STREQUAL ${CMAKE_CURRENT_SOURCE_DIR})
     # Realm Core is being built as part of another project, likely an SDK
     set(REALM_CORE_SUBMODULE_BUILD ON)
 endif()
@@ -15,6 +15,7 @@ endif()
 include(GNUInstallDirs)
 include(CheckIncludeFiles)
 include(CheckSymbolExists)
+include(CMakePushCheckState)
 include(Utilities)
 include(SpecialtyBuilds)
 include(GetVersion)
@@ -136,12 +137,6 @@ else()
         add_compile_options(-Wunreachable-code -Wshorten-64-to-32 -Wconditional-uninitialized -Wextra-semi -Wno-nested-anon-types -Wdocumentation -Wthread-safety -Wthread-safety-negative -Wmissing-prototypes)
     endif()
 
-    if(CMAKE_CXX_STANDARD EQUAL 20)
-        # std::is_pod was deprecated in c++20, but is still used by 3rd party json parser.
-        # TODO remove this once we upgrade it.
-        add_cxx_flag_if_supported(-Wno-deprecated-declarations)
-    endif()
-
     # By default GCC warns that it changed how it passes bitfields by value as
     # function arguments on arm64 every time this happens. This warning is just
     # an FYI and not pointing out a problem, so just disable it.
@@ -152,6 +147,10 @@ else()
     # This warning is too agressive. It warns about moves that are not redundant on older
     # compilers that we still support. It is also harmless, unlike pessimizing moves.
     add_cxx_flag_if_supported(-Wno-redundant-move)
+
+    # For backwards compatibility libc++ public headers have some transitive
+    # includes which they don't use. Disabling this improves build times a bit.
+    add_compile_definitions(_LIBCPP_REMOVE_TRANSITIVE_INCLUDES)
 
     # Ninja buffers output so we need to tell the compiler to use colors even though stdout isn't a tty.
     if("${CMAKE_GENERATOR}" STREQUAL "Ninja")
@@ -222,7 +221,9 @@ if(MSVC)
         set(CMAKE_EXE_LINKER_FLAGS_DEBUG     "${CMAKE_EXE_LINKER_FLAGS_DEBUG} /INCREMENTAL:NO /OPT:NOREF /OPT:NOICF")
         set(CMAKE_SHARED_LINKER_FLAGS_DEBUG  "${CMAKE_SHARED_LINKER_FLAGS_DEBUG} /INCREMENTAL:NO /OPT:NOREF /OPT:NOICF")
     else()
-        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+            set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
         string(REGEX REPLACE "/RTC(su|[1su])" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
     endif()
 
@@ -237,11 +238,19 @@ if(MSVC)
 endif()
 
 if(UNIX)
+    cmake_push_check_state(RESET)
     # Enable access to large file APIs, but don't make them the default.
     add_compile_definitions("_LARGEFILE_SOURCE" "_LARGEFILE64_SOURCE")
     set(CMAKE_REQUIRED_DEFINITIONS "-D_LARGEFILE_SOURCE" "-D_LARGEFILE64_SOURCE")
     # Use readdir64 if available.
     check_symbol_exists(readdir64 "dirent.h" REALM_HAVE_READDIR64)
+    cmake_reset_check_state()
+    set(CMAKE_REQUIRED_DEFINITIONS "-D_POSIX_C_SOURCE=200112L")
+    check_symbol_exists(posix_fallocate "fcntl.h" REALM_HAVE_POSIX_FALLOCATE)
+    if(REALM_HAVE_POSIX_FALLOCATE)
+        add_compile_definitions("_POSIX_C_SOURCE=200112L")
+    endif()
+    cmake_pop_check_state()
 endif()
 
 # Options (passed to CMake)
@@ -254,14 +263,24 @@ if(NOT EMSCRIPTEN)
 endif()
 option(REALM_ENABLE_MEMDEBUG "Add additional memory checks" OFF)
 option(REALM_VALGRIND "Tell the test suite we are running with valgrind" OFF)
-option(REALM_METRICS "Enable various metric tracking" ON)
 option(REALM_SYNC_MULTIPLEXING "Enables/disables sync session multiplexing by default" ON)
 set(REALM_MAX_BPNODE_SIZE "1000" CACHE STRING "Max B+ tree node size.")
 option(REALM_ENABLE_GEOSPATIAL "Enable geospatial types and queries." ON)
+option(REALM_APP_SERVICES "Enable the default app services implementation." ON)
 
 # Find dependencies
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
+
+# Threads library is pthread-compatible
+# Check for these explicitly because older versions of musl define only one or the other
+if(CMAKE_USE_PTHREADS_INIT)
+    check_symbol_exists(pthread_getname_np "pthread.h" REALM_HAVE_PTHREAD_GETNAME)
+    check_symbol_exists(pthread_setname_np "pthread.h" REALM_HAVE_PTHREAD_SETNAME)
+endif()
+
+find_package(Backtrace)
+set(REALM_HAVE_BACKTRACE ${Backtrace_FOUND})
 
 if(REALM_ENABLE_SYNC)
     option(REALM_FORCE_OPENSSL "Always use OpenSSL for SSL needs, regardless of target platform." OFF)
@@ -276,17 +295,20 @@ elseif(REALM_ENABLE_ENCRYPTION AND CMAKE_SYSTEM_NAME MATCHES "Linux|Android")
 endif()
 
 if(REALM_NEEDS_OPENSSL OR REALM_FORCE_OPENSSL)
+    option(REALM_USE_SYSTEM_OPENSSL "Look for an external OpenSSL installation instead of using prebuilt one." OFF)
+    set(_REALM_USE_OPENSSL_DEFAULT_VERIFY_PATHS ON)
     if(NOT REALM_USE_SYSTEM_OPENSSL AND (ANDROID OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
         # Use our own prebuilt OpenSSL
         realm_acquire_dependency(openssl ${DEP_OPENSSL_VERSION} OPENSSL_CMAKE_INCLUDE_FILE)
 
         include(${OPENSSL_CMAKE_INCLUDE_FILE})
+        set(_REALM_USE_OPENSSL_DEFAULT_VERIFY_PATHS OFF)
     endif()
 
-    set(OPENSSL_USE_STATIC_LIBS ON)
     find_package(OpenSSL REQUIRED)
     set(REALM_HAVE_OPENSSL ON)
-    string(REGEX MATCH "^([0-9]+)\\.([0-9]+)" OPENSSL_VERSION_MAJOR_MINOR ${OPENSSL_VERSION})
+    option(REALM_USE_SYSTEM_OPENSSL_PATHS "Use the system OpenSSL certificate store (specified by the OPENSSLDIR environment variable) at runtime for TLS handshake." ${_REALM_USE_OPENSSL_DEFAULT_VERIFY_PATHS})
+    string(REGEX MATCH "^([0-9]+)\\.([0-9]+)" OPENSSL_VERSION_MAJOR_MINOR "${OPENSSL_VERSION}")
 elseif(APPLE)
     set(REALM_HAVE_SECURE_TRANSPORT "1")
 endif()
@@ -298,8 +320,11 @@ endif()
 # Emscripten does provide Zlib, but it doesn't work with find_package and is handled specially
 if(NOT APPLE AND NOT EMSCRIPTEN AND NOT TARGET ZLIB::ZLIB)
     if(WIN32 OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND REALM_LINUX_TOOLCHAIN))
-        realm_acquire_dependency(zlib ${DEP_ZLIB_VERSION} ZLIB_CMAKE_INCLUDE_FILE)
-        include(${ZLIB_CMAKE_INCLUDE_FILE})
+        find_package(ZLIB)
+        if (NOT ZLIB_FOUND)
+            realm_acquire_dependency(zlib ${DEP_ZLIB_VERSION} ZLIB_CMAKE_INCLUDE_FILE)
+            include(${ZLIB_CMAKE_INCLUDE_FILE})
+        endif()
     elseif(ANDROID)
         # On Android FindZLIB chooses the static libz over the dynamic one, but this leads to issues
         # (see https://github.com/android/ndk/issues/1179)
@@ -332,6 +357,7 @@ include_directories(src)
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/src) # For generated files (like config.h)
 
 add_subdirectory(src)
+add_subdirectory(bindgen)
 
 # Install the licence and changelog files
 install(FILES LICENSE CHANGELOG.md DESTINATION "doc/realm" COMPONENT devel)
@@ -341,40 +367,14 @@ if(REALM_CORE_SUBMODULE_BUILD)
     return()
 endif()
 
-if(CMAKE_SYSTEM_NAME MATCHES "^Windows")
-    # Increase the Catch2 virtual console width because our test names can be very long and they break test reports
-    set(CATCH_CONFIG_CONSOLE_WIDTH 300)
-elseif(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    set(CATCH_CONFIG_NO_POSIX_SIGNALS ON CACHE BOOL "Disable Catch support for POSIX signals on Apple platforms other than macOS")
-endif()
-set(CATCH_CONFIG_ENABLE_ALL_STRINGMAKERS ON CACHE BOOL "Enable Catch2's optional standard library stringmakers")
-
-add_subdirectory(external EXCLUDE_FROM_ALL)
-
-# Cmake does not let us easily set the deployment target per-target, but Catch2
-# can use modern features because we only run tests on recent OS versions.
-target_compile_definitions(Catch2 PRIVATE _LIBCPP_DISABLE_AVAILABILITY)
-
-# Enable CTest and include unit tests
-enable_testing()
-
-if(REALM_BUILD_LIB_ONLY OR REALM_NO_TESTS)
-    set(REALM_EXCLUDE_TESTS EXCLUDE_FROM_ALL)
-endif()
-add_subdirectory(test ${REALM_EXCLUDE_TESTS})
-
-if (REALM_BUILD_TEST_CLIENT)
-    add_subdirectory(test/client)
-endif()
-
 # Make the project importable from the build directory
 set(REALM_EXPORTED_TARGETS
-    Storage
-    QueryParser
-    ObjectStore
-    RealmFFI
-    RealmFFIStatic
-)
+        Storage
+        QueryParser
+        ObjectStore
+        RealmFFI
+        RealmFFIStatic
+        )
 if(REALM_ENABLE_SYNC)
     list(APPEND REALM_EXPORTED_TARGETS Sync)
 endif()
@@ -386,19 +386,28 @@ configure_file(tools/cmake/AcquireRealmDependency.cmake ${CMAKE_CURRENT_BINARY_D
 install(EXPORT realm
         NAMESPACE Realm::
         FILE RealmTargets.cmake
-        DESTINATION lib/cmake/Realm
+        DESTINATION share/cmake/Realm
         COMPONENT devel
-)
+        )
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/RealmConfig.cmake
-        DESTINATION lib/cmake/Realm
+        DESTINATION share/cmake/Realm
         COMPONENT devel
-)
+        )
 
 install(FILES tools/cmake/AcquireRealmDependency.cmake
-        DESTINATION lib/cmake/Realm
+        DESTINATION share/cmake/Realm
         COMPONENT devel
-)
+        )
+
+if(NOT REALM_BUILD_LIB_ONLY AND NOT REALM_NO_TESTS)
+    enable_testing()
+    add_subdirectory(test)
+endif()
+
+if (REALM_BUILD_TEST_CLIENT)
+    add_subdirectory(test/client)
+endif()
 
 # CPack
 set(CPACK_GENERATOR "TGZ")

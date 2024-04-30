@@ -56,7 +56,7 @@ public:
 
     struct PendingBatch {
         int64_t query_version = 0;
-        std::vector<Transformer::RemoteChangeset> changesets;
+        std::vector<RemoteChangeset> changesets;
         std::vector<util::AppendBuffer<char>> changeset_data;
         util::Optional<SyncProgress> progress;
         size_t remaining_changesets = 0;
@@ -79,9 +79,10 @@ public:
 
     // Adds a set of changesets to the store.
     void add_batch(int64_t query_version, util::Optional<SyncProgress> progress,
-                   const std::vector<Transformer::RemoteChangeset>& changesets, bool* created_new_batch);
+                   const std::vector<RemoteChangeset>& changesets, bool* created_new_batch);
 
     void clear();
+    void clear(Transaction& wt);
 
 
 private:

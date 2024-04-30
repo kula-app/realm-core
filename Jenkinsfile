@@ -15,6 +15,7 @@ branch = tokens[tokens.size()-1]
 ctest_cmd = "ctest -VV"
 warningFilters = [
     excludeFile('/external/*'), // submodules and external libraries
+    excludeFile('/src/external/*'), // submodules and external libraries
     excludeFile('/libuv-src/*'), // libuv, where it was downloaded and built inside cmake
     excludeFile('/src/realm/parser/generated/*'), // the auto generated parser code we didn't write
 ]
@@ -27,8 +28,8 @@ jobWrapper {
             getSourceArchive()
             stash includes: '**', name: 'core-source', useDefaultExcludes: false
 
-            dependencies = readProperties file: 'dependencies.list'
-            echo "Version in dependencies.list: ${dependencies.VERSION}"
+            dependencies = readYaml file: 'dependencies.yml'
+            echo "Version in dependencies.yml: ${dependencies.VERSION}"
             gitTag = readGitTag()
             gitSha = sh(returnStdout: true, script: 'git rev-parse HEAD').trim().take(8)
             gitDescribeVersion = sh(returnStdout: true, script: 'git describe --tags').trim()
@@ -180,6 +181,7 @@ jobWrapper {
 
             parallelExecutors = [
                 buildLinuxRelease       : doBuildLinux('Release'),
+                checkAlpine             : doCheckAlpine(buildOptions + [enableSync: true]),
                 checkLinuxDebug         : doCheckInDocker(buildOptions + [useToolchain : true]),
                 checkLinuxDebugEncrypt  : doCheckInDocker(buildOptions + [useEncryption : true]),
                 checkLinuxRelease_4     : doCheckInDocker(buildOptions + [maxBpNodeSize: 4, buildType : 'Release', useToolchain : true]),
@@ -196,12 +198,10 @@ jobWrapper {
                 buildAndroidArm64Debug  : doAndroidBuildInDocker('arm64-v8a', 'Debug'),
                 buildAndroidTestsArmeabi: doAndroidBuildInDocker('armeabi-v7a', 'Debug', TestAction.Build),
                 buildEmscripten         : doBuildEmscripten('Debug'),
-                threadSanitizer         : doCheckSanity(buildOptions + [enableSync: true, sanitizeMode: 'thread']),
-                addressSanitizer        : doCheckSanity(buildOptions + [enableSync: true, sanitizeMode: 'address']),
             ]
             if (releaseTesting) {
                 extendedChecks = [
-                    checkMacOsDebug               : doBuildMacOs(buildOptions + [buildType: "Release"]),
+                    checkMacOsDebug               : doBuildMacOs(buildOptions + [buildType: "Debug"]),
                     checkAndroidarmeabiDebug      : doAndroidBuildInDocker('armeabi-v7a', 'Debug', TestAction.Run),
                     // FIXME: https://github.com/realm/realm-core/issues/4159
                     //checkAndroidx86Release        : doAndroidBuildInDocker('x86', 'Release', TestAction.Run),
@@ -222,12 +222,6 @@ def doCheckInDocker(Map options = [:]) {
         REALM_ENABLE_ENCRYPTION: options.enableEncryption ? 'ON' : 'OFF',
         REALM_ENABLE_SYNC: options.enableSync ? 'ON' : 'OFF',
     ]
-    if (options.enableSync) {
-        cmakeOptions << [
-            REALM_ENABLE_AUTH_TESTS: 'ON',
-            REALM_MONGODB_ENDPOINT: 'http://mongodb-realm:9090',
-        ]
-    }
     if (longRunningTests) {
         cmakeOptions << [
             CMAKE_CXX_FLAGS: '"-DTEST_DURATION=1"',
@@ -275,63 +269,42 @@ def doCheckInDocker(Map options = [:]) {
                 }
             }
 
-            if (options.enableSync) {
-                // stitch images are auto-published every day to our CI
-                // see https://github.com/realm/ci/tree/master/realm/docker/mongodb-realm
-                // we refrain from using "latest" here to optimise docker pull cost due to a new image being built every day
-                // if there's really a new feature you need from the latest stitch, upgrade this manually
-                withRealmCloud(version: dependencies.MDBREALM_TEST_SERVER_TAG) { networkName ->
-                    buildSteps("--network=${networkName}")
-                }
+            buildSteps()
 
-                if (options.dumpChangesetTransform) {
-                    buildEnv.inside {
-                        dir('build-dir/test') {
-                            withEnv([
-                                'UNITTEST_PROGRESS=1',
-                                'UNITTEST_FILTER=Array_Example Transform_* EmbeddedObjects_*',
-                                'UNITTEST_DUMP_TRANSFORM=changeset_dump',
-                            ]) {
-                                sh '''
-                                    ./realm-sync-tests
-                                    tar -zcvf changeset_dump.tgz changeset_dump
-                                '''
-                            }
-                            withAWS(credentials: 'stitch-sync-s3', region: 'us-east-1') {
-                                retry(20) {
-                                    s3Upload file: 'changeset_dump.tgz', bucket: 'realm-test-artifacts', acl: 'PublicRead', path: "sync-transform-corpuses/${gitSha}/"
-                                }
+            if (options.dumpChangesetTransform) {
+                buildEnv.inside {
+                    dir('build-dir/test') {
+                        withEnv([
+                            'UNITTEST_PROGRESS=1',
+                            'UNITTEST_FILTER=Array_Example Transform_* EmbeddedObjects_*',
+                            'UNITTEST_DUMP_TRANSFORM=changeset_dump',
+                        ]) {
+                            sh '''
+                                ./realm-sync-tests
+                                tar -zcvf changeset_dump.tgz changeset_dump
+                            '''
+                        }
+                        withAWS(credentials: 'stitch-sync-s3', region: 'us-east-1') {
+                            retry(20) {
+                                s3Upload file: 'changeset_dump.tgz', bucket: 'realm-test-artifacts', acl: 'PublicRead', path: "sync-transform-corpuses/${gitSha}/"
                             }
                         }
                     }
                 }
-            } else {
-                buildSteps()
             }
         }
     }
 }
 
-def doCheckSanity(Map options = [:]) {
-    def privileged = '';
-
+def doCheckAlpine(Map options = [:]) {
     def cmakeOptions = [
         CMAKE_BUILD_TYPE: options.buildType,
         REALM_MAX_BPNODE_SIZE: options.maxBpNodeSize,
-        REALM_ENABLE_SYNC: options.enableSync,
+        REALM_ENABLE_ENCRYPTION: options.enableEncryption ? 'ON' : 'OFF',
+        REALM_ENABLE_SYNC: options.enableSync ? 'ON' : 'OFF',
+        REALM_USE_SYSTEM_OPENSSL: 'ON',
+        OPENSSL_USE_STATIC_LIBS: 'OFF',
     ]
-
-    if (options.sanitizeMode.contains('thread')) {
-        cmakeOptions << [
-            REALM_TSAN: "ON",
-        ]
-    }
-    else if (options.sanitizeMode.contains('address')) {
-        privileged = '--privileged'
-        cmakeOptions << [
-            REALM_ASAN: "ON",
-        ]
-    }
 
     def cmakeDefinitions = cmakeOptions.collect { k,v -> "-D$k=$v" }.join(' ')
 
@@ -339,32 +312,38 @@ def doCheckSanity(Map options = [:]) {
         rlmNode('docker') {
             getArchive()
 
-            def environment = environment() + [
-              'CC=clang',
-              'CXX=clang++',
-              'UNITTEST_XML=unit-test-report.xml',
-              "UNITTEST_SUITE_NAME=Linux-${options.buildType}",
-              "TSAN_OPTIONS=\"suppressions=${WORKSPACE}/test/tsan.suppress\""
-            ]
-            buildDockerEnv('linux.Dockerfile').inside(privileged) {
-                withEnv(environment) {
-                    try {
-                        dir('build-dir') {
-                            sh "cmake ${cmakeDefinitions} -G Ninja .."
-                            runAndCollectWarnings(
-                                script: 'ninja',
-                                parser: "clang",
-                                name: "linux-clang-${options.buildType}-${options.sanitizeMode}",
-                                filters: warningFilters,
-                            )
-                            sh "${ctest_cmd}"
-                        }
+            def buildEnv = buildDockerEnv('alpine.Dockerfile')
 
-                    } finally {
-                        junit testResults: 'build-dir/test/unit-test-report.xml'
+            def environment = environment()
+            environment << 'UNITTEST_XML=unit-test-report.xml'
+            environment << "UNITTEST_SUITE_NAME=Alpine-${options.buildType}"
+            if (options.useEncryption) {
+                environment << 'UNITTEST_ENCRYPT_ALL=1'
+            }
+
+            // We don't enable this by default, because using a toolchain with its own sysroot
+            // prevents CMake from finding system libraries like curl which we use in sync tests.
+            if (options.useToolchain) {
+                cmakeDefinitions += " -DCMAKE_TOOLCHAIN_FILE=\"${env.WORKSPACE}/tools/cmake/x86_64-linux-musl.toolchain.cmake\""
+            }
+
+            buildEnv.inside {
+                    withEnv(environment) {
+                        try {
+                            dir('build-dir') {
+                                sh "cmake ${cmakeDefinitions} -G Ninja .."
+                                runAndCollectWarnings(
+                                    script: 'ninja',
+                                    name: "alpine-${options.buildType}-encrypt${options.enableEncryption}-BPNODESIZE_${options.maxBpNodeSize}",
+                                    filters: warningFilters,
+                                )
+                                sh "${ctest_cmd}"
+                            }
+                        } finally {
+                            junit testResults: 'build-dir/test/unit-test-report.xml'
+                        }
                     }
                 }
-            }
         }
     }
 }
@@ -611,8 +590,11 @@ def doBuildMacOs(Map options = [:]) {
 
             dir('build-macosx') {
                 withEnv(['DEVELOPER_DIR=/Applications/Xcode-14.app/Contents/Developer/']) {
-                    sh "cmake ${cmakeDefinitions} -G Xcode .."
-
+                     try {
+                        sh "cmake ${cmakeDefinitions} -G Xcode .."
+                    } catch(Exception e) {
+                        archiveArtifacts '**/*'
+                    }                
                     runAndCollectWarnings(
                         parser: 'clang',
                         script: "cmake --build . --config ${buildType} --target package -- ONLY_ACTIVE_ARCH=NO -destination generic/name=macOS -sdk macosx",
@@ -670,32 +652,19 @@ def doBuildApplePlatform(String platform, String buildType, boolean test = false
                 if (test) {
                     dir('build-xcode-platforms') {
                         if (platform != 'iphonesimulator') error 'Testing is only available for iOS Simulator'
-                        sh "xcodebuild -scheme CoreTests -configuration ${buildType} -sdk iphonesimulator -arch x86_64"
-                        // sh "xcodebuild -scheme SyncTests -configuration ${buildType} -sdk iphonesimulator -arch x86_64 IPHONEOS_DEPLOYMENT_TARGET=13"
-                        sh "xcodebuild -scheme ObjectStoreTests -configuration ${buildType} -sdk iphonesimulator -arch x86_64 IPHONEOS_DEPLOYMENT_TARGET=13"
+                        sh "xcodebuild -scheme CombinedTests -configuration ${buildType} -sdk iphonesimulator -arch x86_64"
 
                         def env = environment().collect { v -> "SIMCTL_CHILD_${v}" }
-                        def resultFile = "${WORKSPACE}/core-test-report.xml"
+                        def resultFile = "${WORKSPACE}/combined-test-report.xml"
                         withEnv(env + ["SIMCTL_CHILD_UNITTEST_XML=${resultFile}", "SIMCTL_CHILD_UNITTEST_SUITE_NAME=iOS-${buildType}-Core"]) {
-                            sh "$WORKSPACE/tools/run-in-simulator.sh 'test/${buildType}-${platform}/realm-tests.app' 'io.realm.CoreTests' '${resultFile}'"
-                        }
-                        // Sync tests currently don't work on iOS because they require an unimplemented server feature
-                        // resultFile = "${WORKSPACE}/sync-test-report.xml"
-                        // withEnv(env + ["SIMCTL_CHILD_UNITTEST_XML=${resultFile}", "SIMCTL_CHILD_UNITTEST_SUITE_NAME=iOS-${buildType}-Sync"]) {
-                        //     sh "$WORKSPACE/tools/run-in-simulator.sh 'test/${buildType}-${platform}/realm-sync-tests.app' 'io.realm.SyncTests' '${resultFile}'"
-                        // }
-                        resultFile = "${WORKSPACE}/object-store-test-report.xml"
-                        withEnv(env + ["SIMCTL_CHILD_UNITTEST_XML=${resultFile}", "SIMCTL_CHILD_UNITTEST_SUITE_NAME=iOS-${buildType}-Object-Store"]) {
-                            sh "$WORKSPACE/tools/run-in-simulator.sh 'test/object-store/${buildType}-${platform}/realm-object-store-tests.app' 'io.realm.ObjectStoreTests' '${resultFile}'"
+                            sh "$WORKSPACE/tools/run-in-simulator.sh 'test/${buildType}-${platform}/realm-combined-tests.app' 'io.realm.CombinedTests' '${resultFile}'"
                         }
                     }
                 }
             }
 
             if (test) {
-                junit testResults: 'core-test-report.xml'
-                // junit testResults: 'sync-test-report.xml'
-                junit testResults: 'object-store-test-report.xml'
+                junit testResults: 'combined-test-report.xml'
             }
 
             String tarball = "realm-${buildType}-${gitDescribeVersion}-${platform}-devel.tar.gz";

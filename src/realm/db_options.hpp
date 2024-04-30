@@ -80,14 +80,6 @@ struct DBOptions {
     /// This string should include a trailing slash '/'.
     std::string temp_dir = sys_tmp_dir;
 
-    /// Controls the feature of collecting various metrics to the DB.
-    /// A prerequisite is compiling with REALM_METRICS=ON.
-    bool enable_metrics = false;
-
-    /// The maximum number of entries stored by the metrics (if enabled). If this number
-    /// is exceeded without being consumed, only the most recent entries will be stored.
-    size_t metrics_buffer_size = 10000;
-
     /// is_immutable should be set to true if run from a read-only file system.
     /// this will prevent the DB from making any writes, also disabling the creation
     /// of write transactions.
@@ -95,6 +87,9 @@ struct DBOptions {
 
     /// Disable automatic backup at file format upgrade by setting to false
     bool backup_at_file_format_change = true;
+
+    /// Disable creating new files if the DB to open does not already exist.
+    bool no_create = false;
 
     /// List of versions we can upgrade from
     BackupHandler::VersionList accepted_versions = BackupHandler::accepted_versions_;
@@ -106,6 +101,10 @@ struct DBOptions {
     /// this will make *all* writes async and then wait on the result, which has
     /// a performance impact.
     bool enable_async_writes = false;
+
+    /// If set, opening a file which is not a Realm file or cannot be decrypted
+    /// will clear and reinitialize the file.
+    bool clear_on_invalid_file = false;
 
     /// sys_tmp_dir will be used if the temp_dir is empty when creating DBOptions.
     /// It must be writable and allowed to create pipe/fifo file on it.

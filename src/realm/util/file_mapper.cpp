@@ -25,7 +25,6 @@
 #else
 #include <cerrno>
 #include <sys/mman.h>
-#include <unistd.h>
 #endif
 
 #include <realm/exceptions.hpp>
@@ -60,11 +59,6 @@
 #include <dispatch/dispatch.h>
 #endif
 
-#if REALM_ANDROID
-#include <linux/unistd.h>
-#include <sys/syscall.h>
-#endif
-
 #endif // enable encryption
 
 namespace {
@@ -92,12 +86,7 @@ size_t round_up_to_page_size(size_t size) noexcept
 
 // A list of all of the active encrypted mappings for a single file
 struct mappings_for_file {
-#ifdef _WIN32
-    HANDLE handle;
-#else
-    dev_t device;
-    ino_t inode;
-#endif
+    File::UniqueID file_unique_id;
     std::shared_ptr<SharedFileInfo> info;
 };
 
@@ -138,7 +127,6 @@ int64_t fetch_value_in_file(const std::string& fname, const char* scan_pattern)
     }
     return PageReclaimGovernor::no_match;
 }
-
 
 /* Default reclaim governor
  *
@@ -253,13 +241,8 @@ static dispatch_queue_t reclaimer_queue;
 static void ensure_reclaimer_thread_runs()
 {
     if (!reclaimer_timer) {
-        if (__builtin_available(iOS 10, macOS 12, tvOS 10, watchOS 3, *)) {
-            reclaimer_queue = dispatch_queue_create_with_target("io.realm.page-reclaimer", DISPATCH_QUEUE_SERIAL,
-                                                                dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0));
-        }
-        else {
-            reclaimer_queue = dispatch_queue_create("io.realm.page-reclaimer", DISPATCH_QUEUE_SERIAL);
-        }
+        reclaimer_queue = dispatch_queue_create_with_target("io.realm.page-reclaimer", DISPATCH_QUEUE_SERIAL,
+                                                            dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0));
         reclaimer_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, reclaimer_queue);
         dispatch_source_set_timer(reclaimer_timer, DISPATCH_TIME_NOW, NSEC_PER_SEC, NSEC_PER_SEC);
         dispatch_source_set_event_handler(reclaimer_timer, ^{
@@ -483,19 +466,12 @@ mapping_and_addr* find_mapping_for_addr(void* addr, size_t size)
 SharedFileInfo* get_file_info_for_file(File& file)
 {
     LockGuard lock(mapping_mutex);
-#ifndef _WIN32
     File::UniqueID id = file.get_unique_id();
-#endif
     std::vector<mappings_for_file>::iterator it;
     for (it = mappings_by_file.begin(); it != mappings_by_file.end(); ++it) {
-#ifdef _WIN32
-        auto fd = file.get_descriptor();
-        if (File::is_same_file_static(it->handle, fd))
+        if (it->file_unique_id == id) {
             break;
-#else
-        if (it->inode == id.inode && it->device == id.device)
-            break;
-#endif
+        }
     }
     if (it == mappings_by_file.end())
         return nullptr;
@@ -503,34 +479,24 @@ SharedFileInfo* get_file_info_for_file(File& file)
         return it->info.get();
 }
 
-
 namespace {
 EncryptedFileMapping* add_mapping(void* addr, size_t size, const FileAttributes& file, size_t file_offset)
 {
-#ifndef _WIN32
-    struct stat st;
-
-    if (fstat(file.fd, &st)) {
-        int err = errno; // Eliminate any risk of clobbering
-        throw std::system_error(err, std::system_category(), "fstat() failed");
-    }
-#endif
-
     size_t fs = to_size_t(File::get_size_static(file.fd));
-    if (fs > 0 && fs < page_size())
-        throw DecryptionFailed();
+    if (fs > 0 && fs < c_min_encrypted_file_size)
+        throw DecryptionFailed(
+            util::format("file size %1 is less than the minimum encrypted file size of %2 for '%3'", fs,
+                         c_min_encrypted_file_size, file.path));
 
     LockGuard lock(mapping_mutex);
 
+    File::UniqueID fuid = File::get_unique_id(file.fd, file.path);
+
     std::vector<mappings_for_file>::iterator it;
     for (it = mappings_by_file.begin(); it != mappings_by_file.end(); ++it) {
-#ifdef _WIN32
-        if (File::is_same_file_static(it->handle, file.fd))
+        if (it->file_unique_id == fuid) {
             break;
-#else
-        if (it->inode == st.st_ino && it->device == st.st_dev)
-            break;
-#endif
+        }
     }
 
     // Get the potential memory allocation out of the way so that mappings_by_addr.push_back can't throw
@@ -540,24 +506,8 @@ EncryptedFileMapping* add_mapping(void* addr, size_t size, const FileAttributes&
         mappings_by_file.reserve(mappings_by_file.size() + 1);
         mappings_for_file f;
         f.info = std::make_shared<SharedFileInfo>(reinterpret_cast<const uint8_t*>(file.encryption_key));
-
-        FileDesc fd_duped;
-#ifdef _WIN32
-        if (!DuplicateHandle(GetCurrentProcess(), file.fd, GetCurrentProcess(), &fd_duped, 0, FALSE,
-                             DUPLICATE_SAME_ACCESS))
-            throw std::system_error(GetLastError(), std::system_category(), "DuplicateHandle() failed");
-        f.info->fd = f.handle = fd_duped;
-#else
-        fd_duped = dup(file.fd);
-
-        if (fd_duped == -1) {
-            int err = errno; // Eliminate any risk of clobbering
-            throw std::system_error(err, std::system_category(), "dup() failed");
-        }
-        f.info->fd = fd_duped;
-        f.device = st.st_dev;
-        f.inode = st.st_ino;
-#endif // conditonal on _WIN32
+        f.info->fd = File::dup_file_desc(file.fd);
+        f.file_unique_id = fuid;
 
         mappings_by_file.push_back(f); // can't throw due to reserve() above
         it = mappings_by_file.end() - 1;
@@ -576,13 +526,9 @@ EncryptedFileMapping* add_mapping(void* addr, size_t size, const FileAttributes&
     }
     catch (...) {
         if (it->info->mappings.empty()) {
-#ifdef _WIN32
-            bool b = CloseHandle(it->info->fd);
-            REALM_ASSERT_RELEASE(b);
-#else
-            ::close(it->info->fd);
-#endif
+            FileDesc fd_to_close = it->info->fd;
             mappings_by_file.erase(it);
+            File::close_static(fd_to_close); // Throws
         }
         throw;
     }
@@ -600,17 +546,9 @@ void remove_mapping(void* addr, size_t size)
 
     for (std::vector<mappings_for_file>::iterator it = mappings_by_file.begin(); it != mappings_by_file.end(); ++it) {
         if (it->info->mappings.empty()) {
-#ifdef _WIN32
-            if (!CloseHandle(it->info->fd))
-                throw std::system_error(GetLastError(), std::system_category(), "CloseHandle() failed");
-#else
-            if (::close(it->info->fd) != 0) {
-                int err = errno;                // Eliminate any risk of clobbering
-                if (err == EBADF || err == EIO) // FIXME: how do we handle EINTR?
-                    throw std::system_error(err, std::system_category(), "close() failed");
-            }
-#endif
+            FileDesc fd_to_close = it->info->fd;
             mappings_by_file.erase(it);
+            File::close_static(fd_to_close); // Throws
             break;
         }
     }

@@ -97,7 +97,7 @@ size_t ParentNode::aggregate_local(QueryStateBase* st, size_t start, size_t end,
     // data type array to make array call match() directly on each match, like for integers.
 
     m_state = st;
-    m_source_column = source_column;
+    m_state->set_payload_column(source_column);
     size_t local_matches = 0;
 
     if (m_children.size() == 1) {
@@ -134,11 +134,7 @@ size_t ParentNode::aggregate_local(QueryStateBase* st, size_t start, size_t end,
         // If index of first match in this node equals index of first match in all remaining nodes, we have a final
         // match
         if (m == r) {
-            Mixed val;
-            if (source_column) {
-                val = source_column->get_any(r);
-            }
-            bool cont = st->match(r, val);
+            bool cont = st->match(r);
             if (!cont) {
                 return static_cast<size_t>(-1);
             }
@@ -151,11 +147,7 @@ size_t ParentNode::find_all_local(size_t start, size_t end)
     while (start < end) {
         start = find_first_local(start, end);
         if (start != not_found) {
-            Mixed val;
-            if (m_source_column) {
-                val = m_source_column->get_any(start);
-            }
-            bool cont = m_state->match(start, val);
+            bool cont = m_state->match(start);
             if (!cont) {
                 return static_cast<size_t>(-1);
             }
@@ -215,6 +207,15 @@ void MixedNode<EqualIns>::init(bool will_query_ranges)
             m_index_matches.clear();
             constexpr bool case_insensitive = true;
             index->find_all(m_index_matches, val_as_string, case_insensitive);
+            // It is unfortunate but necessary to check the type due to Binary and String
+            // having the same StringIndex hash values
+            m_index_matches.erase(std::remove_if(m_index_matches.begin(), m_index_matches.end(),
+                                                 [this](const ObjKey& obj_key) {
+                                                     Mixed to_check =
+                                                         m_table->get_object(obj_key).get_any(m_condition_column_key);
+                                                     return (!Mixed::types_are_comparable(to_check, m_value));
+                                                 }),
+                                  m_index_matches.end());
             m_index_evaluator->init(&m_index_matches);
         }
         else {
@@ -244,18 +245,14 @@ size_t MixedNode<EqualIns>::find_first_local(size_t start, size_t end)
     REALM_ASSERT(m_table);
 
     EqualIns cond;
-    if (m_value.is_type(type_String)) {
+    if (m_value.is_type(type_String, type_Binary)) {
         for (size_t i = start; i < end; i++) {
             QueryValue val(m_leaf->get(i));
-            StringData val_as_str;
-            if (val.is_type(type_String)) {
-                val_as_str = val.get<StringData>();
+            if (!Mixed::types_are_comparable(m_value, val)) {
+                continue;
             }
-            else if (val.is_type(type_Binary)) {
-                val_as_str = StringData(val.get<BinaryData>().data(), val.get<BinaryData>().size());
-            }
-            if (!val_as_str.is_null() &&
-                cond(m_value.get<StringData>(), m_ucase.c_str(), m_lcase.c_str(), val_as_str))
+            StringData val_as_str = val.export_to_type<StringData>();
+            if (cond(m_value.export_to_type<StringData>(), m_ucase.c_str(), m_lcase.c_str(), val_as_str))
                 return i;
         }
     }
@@ -302,7 +299,7 @@ size_t StringNodeEqualBase::find_first_local(size_t start, size_t end)
 }
 
 
-void IndexEvaluator::init(StringIndex* index, Mixed value)
+void IndexEvaluator::init(SearchIndex* index, Mixed value)
 {
     REALM_ASSERT(index);
     m_matching_keys = nullptr;
@@ -383,11 +380,33 @@ size_t IndexEvaluator::do_search_index(const Cluster* cluster, size_t start, siz
     return not_found;
 }
 
+StringNode<Equal>::StringNode(ColKey col, const Mixed* begin, const Mixed* end)
+    : StringNodeEqualBase(StringData(), col)
+{
+    // Don't use the search index if present since we're in a scenario where
+    // it'd be slower
+    m_index_evaluator.reset();
+
+    for (const Mixed* it = begin; it != end; ++it) {
+        if (it->is_null()) {
+            m_needles.emplace();
+        }
+        else if (const StringData* str = it->get_if<StringData>()) {
+            m_needle_storage.push_back(std::make_unique<char[]>(str->size()));
+            std::copy(str->data(), str->data() + str->size(), m_needle_storage.back().get());
+            m_needles.insert(StringData(m_needle_storage.back().get(), str->size()));
+        }
+    }
+    if (m_needles.empty()) {
+        throw InvalidArgument("No string arguments in query");
+    }
+}
+
 void StringNode<Equal>::_search_index_init()
 {
     REALM_ASSERT(bool(m_index_evaluator));
     auto index = ParentNode::m_table.unchecked_ptr()->get_search_index(ParentNode::m_condition_column_key);
-    m_index_evaluator->init(index, StringData(StringNodeBase::m_value));
+    m_index_evaluator->init(index, StringNodeBase::m_string_value);
 }
 
 bool StringNode<Equal>::do_consume_condition(ParentNode& node)
@@ -398,17 +417,31 @@ bool StringNode<Equal>::do_consume_condition(ParentNode& node)
 
     auto& other = static_cast<StringNode<Equal>&>(node);
     REALM_ASSERT(m_condition_column_key == other.m_condition_column_key);
-    REALM_ASSERT(other.m_needles.empty());
+
     if (m_needles.empty()) {
-        m_needles.insert(m_value ? StringData(*m_value) : StringData());
+        m_needles.insert(m_string_value);
     }
-    if (auto& str = other.m_value) {
-        m_needle_storage.push_back(std::make_unique<char[]>(str->size()));
-        std::copy(str->data(), str->data() + str->size(), m_needle_storage.back().get());
-        m_needles.insert(StringData(m_needle_storage.back().get(), str->size()));
+    auto add_string = [&](const StringData& str) {
+        if (m_needles.count(str) == 0) {
+            if (str.size()) {
+                m_needle_storage.push_back(std::make_unique<char[]>(str.size()));
+                std::copy(str.data(), str.data() + str.size(), m_needle_storage.back().get());
+                m_needles.insert(StringData(m_needle_storage.back().get(), str.size()));
+            }
+            else {
+                // this code path is different because we need to
+                // distinguish null from the empty string
+                m_needles.insert(str);
+            }
+        }
+    };
+    if (!other.m_needles.empty()) {
+        for (const auto& str : other.m_needles) {
+            add_string(str);
+        }
     }
     else {
-        m_needles.emplace();
+        add_string(other.m_string_value);
     }
     return true;
 }
@@ -416,7 +449,7 @@ bool StringNode<Equal>::do_consume_condition(ParentNode& node)
 size_t StringNode<Equal>::_find_first_local(size_t start, size_t end)
 {
     if (m_needles.empty()) {
-        return m_leaf->find_first(m_value, start, end);
+        return m_leaf->find_first(m_string_value, start, end);
     }
     else {
         if (end == npos)
@@ -450,7 +483,7 @@ void StringNode<EqualIns>::_search_index_init()
     auto index = ParentNode::m_table->get_search_index(ParentNode::m_condition_column_key);
     m_index_matches.clear();
     constexpr bool case_insensitive = true;
-    index->find_all(m_index_matches, StringData(StringNodeBase::m_value), case_insensitive);
+    index->find_all(m_index_matches, StringNodeBase::m_string_value, case_insensitive);
     m_index_evaluator->init(&m_index_matches);
 }
 
@@ -460,7 +493,7 @@ size_t StringNode<EqualIns>::_find_first_local(size_t start, size_t end)
     for (size_t s = start; s < end; ++s) {
         StringData t = get_string(s);
 
-        if (cond(StringData(m_value), m_ucase.c_str(), m_lcase.c_str(), t))
+        if (cond(m_string_value, m_ucase.c_str(), m_lcase.c_str(), t))
             return s;
     }
 
@@ -489,17 +522,17 @@ StringNodeFulltext::StringNodeFulltext(const StringNodeFulltext& other)
 
 void StringNodeFulltext::_search_index_init()
 {
-    auto index = m_link_map->get_target_table()->get_search_index(ParentNode::m_condition_column_key);
+    StringIndex* index = m_link_map->get_target_table()->get_string_index(ParentNode::m_condition_column_key);
     REALM_ASSERT(index && index->is_fulltext_index());
     m_index_matches.clear();
-    index->find_all_fulltext(m_index_matches, StringData(StringNodeBase::m_value));
+    index->find_all_fulltext(m_index_matches, StringNodeBase::m_string_value);
 
     // If links exists, use backlinks to find the original objects
     if (m_link_map->links_exist()) {
         std::set<ObjKey> tmp;
         for (auto k : m_index_matches) {
-            auto ndxs = m_link_map->get_origin_ndxs(k);
-            tmp.insert(ndxs.begin(), ndxs.end());
+            auto keys = m_link_map->get_origin_objkeys(k);
+            tmp.insert(keys.begin(), keys.end());
         }
         m_index_matches.assign(tmp.begin(), tmp.end());
     }
@@ -541,7 +574,6 @@ std::unique_ptr<ArrayPayload> TwoColumnsNodeBase::update_cached_leaf_pointers_fo
             return std::make_unique<ArrayUUIDNull>(alloc);
         case col_type_TypedLink:
         case col_type_BackLink:
-        case col_type_LinkList:
             break;
     };
     REALM_UNREACHABLE();
@@ -613,7 +645,7 @@ size_t size_of_list_from_ref(ref_type ref, Allocator& alloc, ColumnType col_type
             list.init_from_ref(ref);
             return list.size();
         }
-        case col_type_LinkList: {
+        case col_type_Link: {
             BPlusTree<ObjKey> list(alloc);
             list.init_from_ref(ref);
             return list.size();
@@ -623,7 +655,6 @@ size_t size_of_list_from_ref(ref_type ref, Allocator& alloc, ColumnType col_type
             list.init_from_ref(ref);
             return list.size();
         }
-        case col_type_Link:
         case col_type_BackLink:
             break;
     }

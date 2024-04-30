@@ -70,10 +70,8 @@ TEST_CASE("thread safe reference") {
 
     TestFile config;
     config.automatic_change_notifications = false;
-    config.cache = false;
-    config.in_memory = true;
-    config.encryption_key = std::vector<char>();
     config.schema = schema;
+    config.in_memory = true;
     auto r = Realm::get_shared_realm(config);
 
     const auto int_obj_col = r->schema().find("int object")->persisted_properties[0].column_key;
@@ -332,7 +330,7 @@ TEST_CASE("thread safe reference") {
 
             SECTION("read-only `ThreadSafeReference` to `Results`") {
                 auto thread_safe_results = ThreadSafeReference(results);
-                JoiningThread([thread_safe_results = std::move(thread_safe_results), config, int_obj_col]() mutable {
+                JoiningThread([&thread_safe_results, &config, int_obj_col]() mutable {
                     SharedRealm realm_in_thread = Realm::get_shared_realm(config);
                     Results resolved_results = thread_safe_results.resolve<Results>(realm_in_thread);
                     REQUIRE(resolved_results.size() == 1);
@@ -343,7 +341,7 @@ TEST_CASE("thread safe reference") {
             SECTION("read-only `ThreadSafeReference` to an `Object`") {
                 Object object(read_only_realm, results.get(0));
                 auto thread_safe_object = ThreadSafeReference(object);
-                JoiningThread([thread_safe_object = std::move(thread_safe_object), config, int_obj_col]() mutable {
+                JoiningThread([&thread_safe_object, &config, int_obj_col]() mutable {
                     SharedRealm realm_in_thread = Realm::get_shared_realm(config);
                     auto resolved_object = thread_safe_object.resolve<Object>(realm_in_thread);
                     REQUIRE(resolved_object.is_valid());
@@ -569,7 +567,7 @@ TEST_CASE("thread safe reference") {
             REQUIRE(results.get<int64_t>(1) == 1);
             REQUIRE(results.get<int64_t>(2) == 2);
             auto ref = ThreadSafeReference(results);
-            JoiningThread([ref = std::move(ref), config]() mutable {
+            JoiningThread([&ref, &config]() mutable {
                 config.scheduler = util::Scheduler::make_frozen(VersionID());
                 SharedRealm r = Realm::get_shared_realm(config);
                 Results results = ref.resolve<Results>(r);
@@ -621,7 +619,7 @@ TEST_CASE("thread safe reference") {
             REQUIRE(results.get<int64_t>(2) == 3);
 
             auto ref = ThreadSafeReference(results);
-            JoiningThread([ref = std::move(ref), config]() mutable {
+            JoiningThread([&ref, &config]() mutable {
                 config.scheduler = util::Scheduler::make_frozen(VersionID());
                 SharedRealm r = Realm::get_shared_realm(config);
                 Results results = ref.resolve<Results>(r);
@@ -806,16 +804,15 @@ TEST_CASE("thread safe reference") {
         }
 
         SECTION("object results") {
-            auto results =
-                create_ref([](auto& r) {
-                    auto obj =
-                        create_object(r, "int array object", {{"value", AnyVector{AnyDict{{"value", INT64_C(0)}}}}});
-                    Results results =
-                        List(r, obj.get_obj(), get_table(*r, "int array object")->get_column_key("value"))
-                            .sort({{"value", true}});
-                    REQUIRE(results.size() == 1);
-                    return results;
-                }).resolve<Results>(r);
+            auto results = create_ref([](auto& r) {
+                               auto obj = create_object(r, "int array object",
+                                                        {{"value", AnyVector{AnyDict{{"value", INT64_C(0)}}}}});
+                               Results results =
+                                   List(r, obj.get_obj(), get_table(*r, "int array object")->get_column_key("value"))
+                                       .sort({{"value", true}});
+                               REQUIRE(results.size() == 1);
+                               return results;
+                           }).resolve<Results>(r);
             REQUIRE(results.is_valid());
             REQUIRE(results.size() == 1);
         }
@@ -939,16 +936,15 @@ TEST_CASE("thread safe reference") {
         }
 
         SECTION("object results") {
-            auto results =
-                create_ref([](auto& r) {
-                    auto obj =
-                        create_object(r, "int array object", {{"value", AnyVector{AnyDict{{"value", INT64_C(0)}}}}});
-                    Results results =
-                        List(r, obj.get_obj(), get_table(*r, "int array object")->get_column_key("value"))
-                            .sort({{"value", true}});
-                    REQUIRE(results.size() == 1);
-                    return results;
-                }).resolve<Results>(r);
+            auto results = create_ref([](auto& r) {
+                               auto obj = create_object(r, "int array object",
+                                                        {{"value", AnyVector{AnyDict{{"value", INT64_C(0)}}}}});
+                               Results results =
+                                   List(r, obj.get_obj(), get_table(*r, "int array object")->get_column_key("value"))
+                                       .sort({{"value", true}});
+                               REQUIRE(results.size() == 1);
+                               return results;
+                           }).resolve<Results>(r);
             REQUIRE(results.is_valid());
             REQUIRE(results.size() == 1);
         }

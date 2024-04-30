@@ -127,17 +127,24 @@ TEST(Transactions_Frozen)
         frozen_workers[j].join();
 }
 
-
 TEST(Transactions_ConcurrentFrozenTableGetByName)
 {
+#if REALM_VALGRIND
+    // This test is slow under valgrind. Additionally, there is
+    // a --max-threads config of 5000 for all (concurrent) tests
+    constexpr int num_threads = 3;
+#else
+    constexpr int num_threads = 1000;
+#endif
+    constexpr int num_tables = 3 * num_threads;
     SHARED_GROUP_TEST_PATH(path);
     std::unique_ptr<Replication> hist_w(make_in_realm_history());
     DBRef db = DB::create(*hist_w, path);
     TransactionRef frozen;
-    std::string table_names[3000];
+    std::string table_names[num_tables];
     {
         auto wt = db->start_write();
-        for (int j = 0; j < 3000; ++j) {
+        for (int j = 0; j < num_tables; ++j) {
             std::string name = "Table" + to_string(j);
             table_names[j] = name;
             wt->add_table(name);
@@ -151,11 +158,11 @@ TEST(Transactions_ConcurrentFrozenTableGetByName)
             frozen->get_table(table_names[j]);
         }
     };
-    std::thread threads[1000];
-    for (int j = 0; j < 1000; ++j) {
-        threads[j] = std::thread(runner, j * 2, j * 2 + 1000);
+    std::thread threads[num_threads];
+    for (int j = 0; j < num_threads; ++j) {
+        threads[j] = std::thread(runner, j * 2, j * 2 + num_threads);
     }
-    for (int j = 0; j < 1000; ++j)
+    for (int j = 0; j < num_threads; ++j)
         threads[j].join();
 }
 
@@ -216,14 +223,22 @@ TEST(Transactions_ReclaimFrozen)
 
 TEST(Transactions_ConcurrentFrozenTableGetByKey)
 {
+#if REALM_VALGRIND
+    // This test is slow under valgrind. Additionally, there is
+    // a --max-threads config of 5000 for all (concurrent) tests
+    constexpr int num_threads = 3;
+#else
+    constexpr int num_threads = 1000;
+#endif
+    constexpr int num_tables = 3 * num_threads;
     SHARED_GROUP_TEST_PATH(path);
     std::unique_ptr<Replication> hist_w(make_in_realm_history());
     DBRef db = DB::create(*hist_w, path);
     TransactionRef frozen;
-    TableKey table_keys[3000];
+    TableKey table_keys[num_tables];
     {
         auto wt = db->start_write();
-        for (int j = 0; j < 3000; ++j) {
+        for (int j = 0; j < num_tables; ++j) {
             std::string name = "Table" + to_string(j);
             auto table = wt->add_table(name);
             table_keys[j] = table->get_key();
@@ -238,11 +253,11 @@ TEST(Transactions_ConcurrentFrozenTableGetByKey)
             CHECK(table->get_key() == table_keys[j]);
         }
     };
-    std::thread threads[1000];
-    for (int j = 0; j < 1000; ++j) {
-        threads[j] = std::thread(runner, j * 2, j * 2 + 1000);
+    std::thread threads[num_threads];
+    for (int j = 0; j < num_threads; ++j) {
+        threads[j] = std::thread(runner, j * 2, j * 2 + num_threads);
     }
-    for (int j = 0; j < 1000; ++j)
+    for (int j = 0; j < num_threads; ++j)
         threads[j].join();
 }
 
@@ -1980,117 +1995,6 @@ TEST(LangBindHelper_AdvanceReadTransact_UnorderedTableViewClear)
 }
 
 namespace {
-// A base class for transaction log parsers so that tests which want to test
-// just a single part of the transaction log handling don't have to implement
-// the entire interface
-class NoOpTransactionLogParser {
-public:
-    NoOpTransactionLogParser(TestContext& context)
-        : test_context(context)
-    {
-    }
-
-    TableKey get_current_table() const
-    {
-        return m_current_table;
-    }
-
-    std::pair<ColKey, ObjKey> get_current_linkview() const
-    {
-        return {m_current_linkview_col, m_current_linkview_row};
-    }
-
-protected:
-    TestContext& test_context;
-
-private:
-    TableKey m_current_table;
-    ColKey m_current_linkview_col;
-    ObjKey m_current_linkview_row;
-
-public:
-    void parse_complete() {}
-
-    bool select_table(TableKey t)
-    {
-        m_current_table = t;
-        return true;
-    }
-
-    bool select_collection(ColKey col_key, ObjKey obj_key)
-    {
-        m_current_linkview_col = col_key;
-        m_current_linkview_row = obj_key;
-        return true;
-    }
-
-    // Default no-op implementations of all of the mutation instructions
-    bool insert_group_level_table(TableKey)
-    {
-        return false;
-    }
-    bool erase_class(TableKey)
-    {
-        return false;
-    }
-    bool rename_class(TableKey)
-    {
-        return false;
-    }
-    bool insert_column(ColKey)
-    {
-        return false;
-    }
-    bool erase_column(ColKey)
-    {
-        return false;
-    }
-    bool rename_column(ColKey)
-    {
-        return false;
-    }
-    bool set_link_type(ColKey)
-    {
-        return false;
-    }
-    bool create_object(ObjKey)
-    {
-        return false;
-    }
-    bool remove_object(ObjKey)
-    {
-        return false;
-    }
-    bool collection_set(size_t)
-    {
-        return false;
-    }
-    bool collection_clear(size_t)
-    {
-        return false;
-    }
-    bool collection_erase(size_t)
-    {
-        return false;
-    }
-    bool collection_insert(size_t)
-    {
-        return false;
-    }
-    bool collection_move(size_t, size_t)
-    {
-        return false;
-    }
-    bool modify_object(ColKey, ObjKey)
-    {
-        return false;
-    }
-    bool typed_link_change(ColKey, TableKey)
-    {
-        return true;
-    }
-};
-
 struct AdvanceReadTransact {
     template <typename Func>
     static void call(TransactionRef tr, Func* func)
@@ -2127,8 +2031,12 @@ TEST_TYPES(LangBindHelper_AdvanceReadTransact_TransactLog, AdvanceReadTransact, 
 
     {
         // With no changes, the handler should not be called at all
-        struct : NoOpTransactionLogParser {
-            using NoOpTransactionLogParser::NoOpTransactionLogParser;
+        struct Parser : _impl::NoOpTransactionLogParser {
+            TestContext& test_context;
+            Parser(TestContext& context)
+                : test_context(context)
+            {
+            }
             void parse_complete()
             {
                 CHECK(false);
@@ -2142,10 +2050,15 @@ TEST_TYPES(LangBindHelper_AdvanceReadTransact_TransactLog, AdvanceReadTransact, 
         auto wt = sg->start_write();
         wt->commit();
 
-        struct foo : NoOpTransactionLogParser {
-            using NoOpTransactionLogParser::NoOpTransactionLogParser;
-
+        struct Parser : _impl::NoOpTransactionLogParser {
+            TestContext& test_context;
             bool called = false;
+
+            Parser(TestContext& context)
+                : test_context(context)
+            {
+            }
+
             void parse_complete()
             {
                 called = true;
@@ -2157,12 +2070,16 @@ TEST_TYPES(LangBindHelper_AdvanceReadTransact_TransactLog, AdvanceReadTransact, 
     ObjKey o0, o1;
     {
         // Make a simple modification and verify that the appropriate handler is called
-        struct foo : NoOpTransactionLogParser {
-            using NoOpTransactionLogParser::NoOpTransactionLogParser;
-
+        struct Parser : _impl::NoOpTransactionLogParser {
+            TestContext& test_context;
             size_t expected_table = 0;
             TableKey t1;
             TableKey t2;
+
+            Parser(TestContext& context)
+                : test_context(context)
+            {
+            }
 
             bool create_object(ObjKey)
             {
@@ -2206,15 +2123,19 @@ TEST_TYPES(LangBindHelper_AdvanceReadTransact_TransactLog, AdvanceReadTransact, 
         wt.get_table("table 2")->remove_object(o1);
         wt.commit();
 
-        struct : NoOpTransactionLogParser {
-            using NoOpTransactionLogParser::NoOpTransactionLogParser;
+        struct Parser : _impl::NoOpTransactionLogParser {
+            TestContext& test_context;
+            Parser(TestContext& context)
+                : test_context(context)
+            {
+            }
 
             bool remove_object(ObjKey o)
             {
                 CHECK(o == o1 || o == o0);
                 return true;
             }
-            bool select_collection(ColKey col, ObjKey o)
+            bool select_collection(ColKey col, ObjKey o, const StablePath&)
             {
                 CHECK(col == link_list_col);
                 CHECK(o == okey);
@@ -2259,8 +2180,12 @@ TEST_TYPES(LangBindHelper_AdvanceReadTransact_TransactLog, AdvanceReadTransact, 
         WriteTransaction wt(sg);
         wt.get_table("link origin")->begin()->get_linklist(c3).clear();
         wt.commit();
-        struct : NoOpTransactionLogParser {
-            using NoOpTransactionLogParser::NoOpTransactionLogParser;
+        struct Parser : _impl::NoOpTransactionLogParser {
+            TestContext& test_context;
+            Parser(TestContext& context)
+                : test_context(context)
+            {
+            }
 
             bool collection_clear(size_t old_size) const
             {
@@ -2299,11 +2224,14 @@ TEST(LangBindHelper_AdvanceReadTransact_ErrorInObserver)
         wt->commit();
     }
 
-    struct ObserverError {
-    };
+    struct ObserverError {};
     try {
-        struct : NoOpTransactionLogParser {
-            using NoOpTransactionLogParser::NoOpTransactionLogParser;
+        struct Parser : _impl::NoOpTransactionLogParser {
+            TestContext& test_context;
+            Parser(TestContext& context)
+                : test_context(context)
+            {
+            }
 
             bool modify_object(ColKey, ObjKey) const
             {
@@ -5266,7 +5194,7 @@ TEST(LangBindHelper_SessionHistoryConsistency)
     // session participants must still agree
     {
         // No history
-        DBRef sg = DB::create(path, false, DBOptions(crypt_key()));
+        DBRef sg = DB::create(path, DBOptions(crypt_key()));
 
         // Out-of-Realm history
         std::unique_ptr<Replication> hist = realm::make_in_realm_history();
@@ -5295,7 +5223,7 @@ TEST(LangBindHelper_InRealmHistory_Upgrade)
     SHARED_GROUP_TEST_PATH(path_2);
     {
         // No history
-        DBRef sg = DB::create(path_2, false, DBOptions(crypt_key()));
+        DBRef sg = DB::create(path_2, DBOptions(crypt_key()));
         WriteTransaction wt(sg);
         wt.commit();
     }
@@ -5320,7 +5248,7 @@ TEST(LangBindHelper_InRealmHistory_Downgrade)
     }
     {
         // No history
-        CHECK_THROW(DB::create(path, false, DBOptions(crypt_key())), IncompatibleHistories);
+        CHECK_THROW(DB::create(path, DBOptions(crypt_key())), IncompatibleHistories);
     }
 }
 
