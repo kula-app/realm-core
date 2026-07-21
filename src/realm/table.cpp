@@ -1577,16 +1577,6 @@ uint64_t Table::allocate_sequence_number()
     return sn;
 }
 
-void Table::set_sequence_number(uint64_t seq)
-{
-    m_top.set(top_position_for_sequence_number, RefOrTagged::make_tagged(seq));
-}
-
-void Table::set_collision_map(ref_type ref)
-{
-    m_top.set(top_position_for_collision_map, RefOrTagged::make_ref(ref));
-}
-
 void Table::set_col_key_sequence_number(uint64_t seq)
 {
     m_top.set(top_position_for_column_key, RefOrTagged::make_tagged(seq));
@@ -1962,18 +1952,18 @@ void Table::update_from_parent() noexcept
 {
     // There is no top for sub-tables sharing spec
     if (m_top.is_attached()) {
-        m_top.update_from_parent();
-        m_spec.update_from_parent();
+        m_top.init_from_parent();
+        m_spec.init_from_parent();
         m_clusters.update_from_parent();
-        m_index_refs.update_from_parent();
+        m_index_refs.init_from_parent();
         for (auto&& index : m_index_accessors) {
             if (index != nullptr) {
                 index->update_from_parent();
             }
         }
 
-        m_opposite_table.update_from_parent();
-        m_opposite_column.update_from_parent();
+        m_opposite_table.init_from_parent();
+        m_opposite_column.init_from_parent();
         if (m_top.size() > top_position_for_flags) {
             uint64_t flags = m_top.get_as_ref_or_tagged(top_position_for_flags).get_as_int();
             m_table_type = Type(flags & table_type_mask);
@@ -2253,8 +2243,10 @@ Obj Table::create_linked_object()
 
     GlobalKey object_id = allocate_object_id_squeezed();
     ObjKey key = object_id.get_local_key(get_sync_file_id());
-
     REALM_ASSERT(key.value >= 0);
+
+    if (auto repl = get_repl())
+        repl->create_linked_object(this, key);
 
     Obj obj = m_clusters.insert(key, {});
 
@@ -2367,6 +2359,13 @@ Obj Table::create_object_with_primary_key(const Mixed& primary_key, FieldValues&
 
     // Check if unresolved exists
     if (unres_key) {
+        if (Replication* repl = get_repl()) {
+            if (auto logger = repl->would_log(util::Logger::Level::debug)) {
+                logger->log(LogCategory::object, util::Logger::Level::debug, "Cancel tombstone on '%1': %2",
+                            get_class_name(), unres_key);
+            }
+        }
+
         auto tombstone = m_tombstones->get(unres_key);
         ret.assign_pk_and_backlinks(tombstone);
         // If tombstones had no links to it, it may still be alive
@@ -2637,6 +2636,13 @@ Obj Table::get_or_create_tombstone(ObjKey key, ColKey pk_col, Mixed pk_val)
             }
         }
         return tombstone;
+    }
+    if (Replication* repl = get_repl()) {
+        if (auto logger = repl->would_log(util::Logger::Level::debug)) {
+            logger->log(LogCategory::object, util::Logger::Level::debug,
+                        "Create tombstone for object '%1' with primary key %2 : %3", get_class_name(), pk_val,
+                        unres_key);
+        }
     }
     return m_tombstones->insert(unres_key, {{pk_col, pk_val}});
 }

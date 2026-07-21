@@ -126,12 +126,6 @@ public:
         init_from_ref(ref);
     }
 
-    /// Called in the context of Group::commit() to ensure that attached
-    /// accessors stay valid across a commit. Please note that this works only
-    /// for non-transactional commits. Accessors obtained during a transaction
-    /// are always detached when the transaction ends.
-    void update_from_parent() noexcept;
-
     /// Change the type of an already attached array node.
     ///
     /// The effect of calling this function on an unattached accessor is
@@ -392,7 +386,11 @@ public:
     template <class cond>
     size_t find_first(int64_t value, size_t start = 0, size_t end = size_t(-1)) const
     {
+        static cond c;
         REALM_ASSERT(start <= m_size && (end <= m_size || end == size_t(-1)) && start <= end);
+        if (end - start == 1) {
+            return c(get(start), value) ? start : realm::not_found;
+        }
         // todo, would be nice to avoid this in order to speed up find_first loops
         QueryStateFindFirst state;
         Finder finder = m_vtable->finder[cond::condition];
@@ -528,10 +526,10 @@ protected:
     Getter m_getter = nullptr; // cached to avoid indirection
     const VTable* m_vtable = nullptr;
 
-    uint_least8_t m_width = 0; // Size of an element (meaning depend on type of array).
     int64_t m_lbound;          // min number that can be stored with current m_width
     int64_t m_ubound;          // max number that can be stored with current m_width
 
+    uint8_t m_width = 0;         // Size of an element (meaning depend on type of array).
     bool m_is_inner_bptree_node; // This array is an inner node of B+-tree.
     bool m_has_refs;             // Elements whose first bit is zero are refs to subarrays.
     bool m_context_flag;         // Meaning depends on context.

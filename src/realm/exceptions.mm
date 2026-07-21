@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright 2016 Realm Inc.
+ * Copyright 2024 Realm Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,30 @@
  *
  **************************************************************************/
 
-#import <UIKit/UIKit.h>
+#include <realm/exceptions.hpp>
 
-@interface ViewController : UIViewController
+#include <realm/util/demangle.hpp>
 
+#include <Foundation/Foundation.h>
 
-@end
-
+namespace realm {
+Status exception_to_status() noexcept
+{
+    try {
+        throw;
+    }
+    catch (NSException* e) {
+        return Status(ErrorCodes::UnknownError, e.reason.UTF8String);
+    }
+    catch (const Exception& e) {
+        return e.to_status();
+    }
+    catch (const std::exception& e) {
+        return Status(ErrorCodes::UnknownError,
+                      util::format("Caught std::exception of type %1: %2", util::get_type_name(e), e.what()));
+    }
+    catch (...) {
+        REALM_UNREACHABLE();
+    }
+}
+} // namespace realm

@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright 2016 Realm Inc.
+ * Copyright 2024 Realm Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,24 @@
  *
  **************************************************************************/
 
-#import <UIKit/UIKit.h>
+#include "test.hpp"
 
-@interface ViewController : UIViewController
+#include "realm/status.hpp"
 
+#include <Foundation/Foundation.h>
 
-@end
-
+namespace realm {
+namespace {
+TEST(Status_NSException)
+{
+    try {
+        @throw [NSException exceptionWithName:@"Exception Name" reason:@"Expected reason" userInfo:nil];
+    }
+    catch (...) {
+        auto status = exception_to_status();
+        CHECK_EQUAL(status.code(), ErrorCodes::UnknownError);
+        CHECK_EQUAL(status.reason(), "Expected reason");
+    }
+}
+} // namespace
+} // namespace realm

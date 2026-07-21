@@ -68,12 +68,24 @@ public:
         m_cv.notify_one();
     }
 
-    void wait_for(E target)
+    // Wait for the provided callback to return true
+    bool wait_until(util::UniqueFunction<bool(E cur_state)> pred,
+                    std::chrono::milliseconds period = std::chrono::seconds(15))
     {
         std::unique_lock lock{m_mutex};
-        m_cv.wait(lock, [&] {
-            return m_cur_state == target;
+        return m_cv.wait_for(lock, period, [&] {
+            return pred(m_cur_state);
         });
+    }
+
+    // Wait for the state machine to reach a specific state
+    bool wait_for(E target, std::chrono::milliseconds period = std::chrono::seconds(15))
+    {
+        return wait_until(
+            [&target](E cur_state) {
+                return cur_state == target;
+            },
+            period);
     }
 
 private:
@@ -182,7 +194,7 @@ std::ostream& operator<<(std::ostream&, const Exception&);
 
 class Realm;
 /// Open a Realm at a given path, creating its files.
-bool create_dummy_realm(std::string path, std::shared_ptr<Realm>* out = nullptr);
+void create_dummy_realm(std::string path, std::shared_ptr<Realm>* out = nullptr);
 std::vector<char> make_test_encryption_key(const char start = 0);
 void catch2_ensure_section_run_workaround(bool did_run_a_section, std::string section_name,
                                           util::FunctionRef<void()> func);

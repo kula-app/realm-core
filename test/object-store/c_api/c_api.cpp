@@ -44,6 +44,7 @@
 #include "../util/test_path.hpp"
 #include "../util/unit_test_transport.hpp"
 
+#include <realm/object-store/c_api/types.hpp>
 #include <realm/object-store/sync/app_utils.hpp>
 #include <realm/object-store/sync/sync_user.hpp>
 #include <realm/sync/client_base.hpp>
@@ -537,36 +538,51 @@ TEST_CASE("C API (non-database)", "[c_api]") {
 
 #if REALM_ENABLE_SYNC
     SECTION("sync_client_config_t") {
+#if REALM_APP_SERVICES
+        // Make a dummy app config and make sure the sync_client_config is updated
+        const uint64_t request_timeout = 2500;
+        auto transport = std::make_shared<UnitTestTransport>(request_timeout);
+        auto http_transport = realm_http_transport(transport);
+        auto app_config = cptr(realm_app_config_new("app_id_123", &http_transport));
+        auto sync_client_config = realm_app_config_get_sync_client_config(app_config.get());
+#else
         auto test_sync_client_config = cptr(realm_sync_client_config_new());
-        realm_sync_client_config_set_reconnect_mode(test_sync_client_config.get(),
-                                                    RLM_SYNC_CLIENT_RECONNECT_MODE_TESTING);
-        CHECK(test_sync_client_config->reconnect_mode ==
+        auto sync_client_config = test_sync_client_config.get();
+#endif // REALM_APP_SERVICES
+
+        realm_sync_client_config_set_reconnect_mode(sync_client_config, RLM_SYNC_CLIENT_RECONNECT_MODE_TESTING);
+        CHECK(sync_client_config->reconnect_mode ==
               static_cast<ReconnectMode>(RLM_SYNC_CLIENT_RECONNECT_MODE_TESTING));
-        realm_sync_client_config_set_multiplex_sessions(test_sync_client_config.get(), true);
-        CHECK(test_sync_client_config->multiplex_sessions);
-        realm_sync_client_config_set_multiplex_sessions(test_sync_client_config.get(), false);
-        CHECK_FALSE(test_sync_client_config->multiplex_sessions);
-        realm_sync_client_config_set_user_agent_binding_info(test_sync_client_config.get(), "some user agent stg");
-        CHECK(test_sync_client_config->user_agent_binding_info == "some user agent stg");
-        realm_sync_client_config_set_user_agent_application_info(test_sync_client_config.get(), "some application");
-        CHECK(test_sync_client_config->user_agent_application_info == "some application");
-        realm_sync_client_config_set_connect_timeout(test_sync_client_config.get(), 666);
-        CHECK(test_sync_client_config->timeouts.connect_timeout == 666);
-        realm_sync_client_config_set_connection_linger_time(test_sync_client_config.get(), 999);
-        CHECK(test_sync_client_config->timeouts.connection_linger_time == 999);
-        realm_sync_client_config_set_ping_keepalive_period(test_sync_client_config.get(), 555);
-        CHECK(test_sync_client_config->timeouts.ping_keepalive_period == 555);
-        realm_sync_client_config_set_pong_keepalive_timeout(test_sync_client_config.get(), 100000);
-        CHECK(test_sync_client_config->timeouts.pong_keepalive_timeout == 100000);
-        realm_sync_client_config_set_fast_reconnect_limit(test_sync_client_config.get(), 1099);
-        CHECK(test_sync_client_config->timeouts.fast_reconnect_limit == 1099);
-        realm_sync_client_config_set_resumption_delay_interval(test_sync_client_config.get(), 1024);
-        CHECK(test_sync_client_config->timeouts.reconnect_backoff_info.resumption_delay_interval.count() == 1024);
-        realm_sync_client_config_set_max_resumption_delay_interval(test_sync_client_config.get(), 600024);
-        CHECK(test_sync_client_config->timeouts.reconnect_backoff_info.max_resumption_delay_interval.count() ==
-              600024);
-        realm_sync_client_config_set_resumption_delay_backoff_multiplier(test_sync_client_config.get(), 1010);
-        CHECK(test_sync_client_config->timeouts.reconnect_backoff_info.resumption_delay_backoff_multiplier == 1010);
+        realm_sync_client_config_set_multiplex_sessions(sync_client_config, true);
+        CHECK(sync_client_config->multiplex_sessions);
+        realm_sync_client_config_set_multiplex_sessions(sync_client_config, false);
+        realm_sync_client_config_set_user_agent_binding_info(sync_client_config, "some user agent stg");
+        realm_sync_client_config_set_user_agent_application_info(sync_client_config, "some application");
+        realm_sync_client_config_set_connect_timeout(sync_client_config, 666);
+        realm_sync_client_config_set_connection_linger_time(sync_client_config, 999);
+        realm_sync_client_config_set_ping_keepalive_period(sync_client_config, 555);
+        realm_sync_client_config_set_pong_keepalive_timeout(sync_client_config, 100000);
+        realm_sync_client_config_set_fast_reconnect_limit(sync_client_config, 1099);
+        realm_sync_client_config_set_resumption_delay_interval(sync_client_config, 1024);
+        realm_sync_client_config_set_max_resumption_delay_interval(sync_client_config, 600024);
+        realm_sync_client_config_set_resumption_delay_backoff_multiplier(sync_client_config, 1010);
+        auto verify_sync_client_config = [](SyncClientConfig* config) {
+            CHECK_FALSE(config->multiplex_sessions);
+            CHECK(config->user_agent_binding_info == "some user agent stg");
+            CHECK(config->user_agent_application_info == "some application");
+            CHECK(config->timeouts.connect_timeout == 666);
+            CHECK(config->timeouts.connection_linger_time == 999);
+            CHECK(config->timeouts.ping_keepalive_period == 555);
+            CHECK(config->timeouts.pong_keepalive_timeout == 100000);
+            CHECK(config->timeouts.fast_reconnect_limit == 1099);
+            CHECK(config->timeouts.reconnect_backoff_info.resumption_delay_interval.count() == 1024);
+            CHECK(config->timeouts.reconnect_backoff_info.max_resumption_delay_interval.count() == 600024);
+            CHECK(config->timeouts.reconnect_backoff_info.resumption_delay_backoff_multiplier == 1010);
+        };
+        verify_sync_client_config(sync_client_config);
+#if REALM_APP_SERVICES
+        verify_sync_client_config(&app_config->sync_client_config);
+#endif // REALM_APP_SERVICES
     }
 
 #if !REALM_APP_SERVICES
@@ -823,6 +839,11 @@ TEST_CASE("C API (non-database)", "[c_api]") {
         realm_app_config_set_base_file_path(app_config.get(), temp_dir.c_str());
         realm_app_config_set_metadata_mode(app_config.get(), RLM_SYNC_CLIENT_METADATA_MODE_DISABLED);
         realm_app_config_set_security_access_group(app_config.get(), "");
+
+        auto sync_client_config = realm_app_config_get_sync_client_config(app_config.get());
+        realm_sync_client_config_set_connect_timeout(sync_client_config, 9876543); // some bogus value
+        // Make sure app_config's sync_client_config has the value we set
+        CHECK(app_config->sync_client_config.timeouts.connect_timeout == 9876543);
 
         auto test_app = cptr(realm_app_create(app_config.get()));
         realm_user_t* sync_user;
@@ -1287,6 +1308,9 @@ TEST_CASE("C API - schema", "[c_api]") {
         realm_config_set_schema_version(config.get(), 0);
         realm_config_set_schema(config.get(), schema.get());
 
+        // no local schema version yet
+        REQUIRE(realm_get_persisted_schema_version(config.get()) == (uint64_t)-1);
+
         SECTION("error on open") {
             {
                 std::ofstream o(test_file_2.path.c_str());
@@ -1304,6 +1328,7 @@ TEST_CASE("C API - schema", "[c_api]") {
             realm_config_set_data_initialization_function(config.get(), initialize_data, &userdata, nullptr);
             auto realm = cptr_checked(realm_open(config.get()));
             CHECK(userdata.num_initializations == 1);
+            REQUIRE(realm_get_persisted_schema_version(config.get()) == 0);
         }
 
         SECTION("data initialization callback error") {
@@ -1323,6 +1348,7 @@ TEST_CASE("C API - schema", "[c_api]") {
             realm_config_set_migration_function(config.get(), migrate_schema, &userdata, nullptr);
             auto realm = cptr_checked(realm_open(config.get()));
             CHECK(userdata.num_migrations == 0);
+            REQUIRE(realm_get_persisted_schema_version(config.get()) == 0);
             realm.reset();
 
             auto config2 = cptr(realm_config_new());
@@ -1334,6 +1360,7 @@ TEST_CASE("C API - schema", "[c_api]") {
             realm_config_set_migration_function(config2.get(), migrate_schema, &userdata, nullptr);
             auto realm2 = cptr_checked(realm_open(config2.get()));
             CHECK(userdata.num_migrations == 1);
+            REQUIRE(realm_get_persisted_schema_version(config2.get()) == 999);
         }
 
         SECTION("migrate schema and delete old table") {
@@ -3103,6 +3130,7 @@ TEST_CASE("C API - properties", "[c_api]") {
                     SECTION("Embedded objects") {
                         realm_property_info_t info;
                         bool found = false;
+                        bool to_be_called = true;
                         realm_key_path_array_t* key_path_array = nullptr;
                         realm_find_property(realm, class_bar.key, "sub", &found, &info);
                         auto bar_sub_key = info.key;
@@ -3113,11 +3141,14 @@ TEST_CASE("C API - properties", "[c_api]") {
                             embedded = cptr_checked(realm_set_embedded(obj2.get(), bar_sub_key));
                         });
 
+                        SECTION("using empty keypath") {
+                            const char* bar_strings[1] = {""};
+                            key_path_array = realm_create_key_path_array(realm, class_bar.key, 0, bar_strings);
+                            to_be_called = false;
+                        }
                         SECTION("using valid nesting") {
-
                             const char* bar_strings[1] = {"sub.int"};
                             key_path_array = realm_create_key_path_array(realm, class_bar.key, 1, bar_strings);
-                            REQUIRE(key_path_array);
                         }
                         SECTION("using star notation") {
                             const char* bar_strings[1] = {"*.int"};
@@ -3133,12 +3164,14 @@ TEST_CASE("C API - properties", "[c_api]") {
                         checked(realm_refresh(realm, nullptr));
 
                         state.called = false;
+                        state.changes = nullptr;
                         write([&]() {
                             checked(realm_set_value(embedded.get(), embedded_int_key, rlm_int_val(999), false));
                         });
-                        REQUIRE(state.called);
+                        REQUIRE(state.called == to_be_called);
                         CHECK(!state.error);
-                        CHECK(state.changes);
+                        if (to_be_called)
+                            CHECK(state.changes);
                     }
                     SECTION("using backlink") {
                         const char* bar_strings[1] = {"linking_objects.public_int"};
@@ -4360,13 +4393,11 @@ TEST_CASE("C API - properties", "[c_api]") {
         auto results = cptr_checked(realm_object_find_all(realm, class_foo.key));
 
         SECTION("wrong thread") {
-            std::thread t{[&]() {
+            JoiningThread{[&] {
                 realm_value_t val;
                 CHECK(!realm_get_value(foo_obj.get(), foo_int_key, &val));
                 CHECK_ERR(RLM_ERR_WRONG_THREAD);
             }};
-
-            t.join();
         }
 
         SECTION("thread-safe references") {
@@ -4378,8 +4409,9 @@ TEST_CASE("C API - properties", "[c_api]") {
             auto results_tsr = cptr_checked(realm_create_thread_safe_reference(results.get()));
 
             SECTION("resolve") {
-                std::thread t{[&]() {
+                JoiningThread{[&] {
                     auto config = make_config(test_file.path.c_str());
+                    config->scheduler = util::Scheduler::make_dummy();
                     auto realm2 = cptr_checked(realm_open(config.get()));
                     auto foo_obj2 =
                         cptr_checked(realm_object_from_thread_safe_reference(realm2.get(), foo_obj_tsr.get()));
@@ -4400,8 +4432,6 @@ TEST_CASE("C API - properties", "[c_api]") {
                     CHECK(realm_results_count(results2.get(), &count));
                     CHECK(count == 1);
                 }};
-
-                t.join();
             }
 
             SECTION("resolve in frozen") {
@@ -4914,7 +4944,7 @@ TEST_CASE("C API - queries", "[c_api]") {
             realm_value_t object_id_arg = rlm_object_id_val("abc123abc123");
             realm_value_t uuid_arg = rlm_uuid_val("01234567-9abc-4def-9012-3456789abcde");
             realm_value_t link_arg = rlm_link_val(class_bar.key, realm_object_get_key(obj2.get()));
-            realm_value_t list_arg[3] = {rlm_int_val(456), rlm_str_val("lol"), rlm_double_val(3.14)};
+            realm_value_t list_arg[3] = {rlm_int_val(456), rlm_str_val("110"), rlm_double_val(3.14)};
 
             static const size_t num_args = 13;
             realm_query_arg_t args[num_args] = {
@@ -5872,6 +5902,7 @@ TEST_CASE("C API - async_open", "[sync][pbs][c_api]") {
         realm_config_set_path(config, test_config.path.c_str());
         realm_config_set_sync_config(config, sync_config);
         realm_config_set_schema_version(config, 1);
+
         realm_async_open_task_t* task = realm_open_synchronized(config);
         REQUIRE(task);
         Userdata userdata;
@@ -5992,9 +6023,15 @@ TEST_CASE("C API - binding callback thread observer", "[sync][c_api]") {
     };
 
     {
-        auto config = cptr(realm_sync_client_config_new());
+#if REALM_APP_SERVICES
+        struct realm_sync_client_config config_struct {};
+        auto config = &config_struct;
+#else
+        auto config_ptr = cptr(realm_sync_client_config_new());
+        auto config = config_ptr.get();
+#endif // REALM_APP_SERVICES
         realm_sync_client_config_set_default_binding_thread_observer(
-            config.get(), bcto_on_thread_create, bcto_on_thread_destroy, bcto_on_thread_error,
+            config, bcto_on_thread_create, bcto_on_thread_destroy, bcto_on_thread_error,
             static_cast<realm_userdata_t>(&bcto_user_data), bcto_free_userdata);
         REQUIRE(config->default_socket_provider_thread_observer);
         auto observer_ptr =
@@ -6005,7 +6042,7 @@ TEST_CASE("C API - binding callback thread observer", "[sync][c_api]") {
         REQUIRE(observer_ptr->has_handle_error());
         REQUIRE(observer_ptr->test_get_userdata_ptr() == &bcto_user_data);
 
-        auto test_thread = std::thread([&]() {
+        JoiningThread([&] {
             auto bcto_ptr = std::static_pointer_cast<realm::BindingCallbackThreadObserver>(
                 config->default_socket_provider_thread_observer);
             REQUIRE(bcto_ptr);
@@ -6016,9 +6053,6 @@ TEST_CASE("C API - binding callback thread observer", "[sync][c_api]") {
             REQUIRE(bcto_ptr->handle_error(MultipleSyncAgents()));
         });
 
-        // Wait for the thread to exit
-        test_thread.join();
-
         REQUIRE(bcto_user_data.thread_create_called);
         REQUIRE(bcto_user_data.thread_on_error_message.find(
                     "Multiple sync agents attempted to join the same session") != std::string::npos);
@@ -6028,8 +6062,14 @@ TEST_CASE("C API - binding callback thread observer", "[sync][c_api]") {
     REQUIRE(bcto_user_data.bcto_deleted == true);
 
     {
-        auto config = cptr(realm_sync_client_config_new());
-        realm_sync_client_config_set_default_binding_thread_observer(config.get(), nullptr, nullptr, nullptr, nullptr,
+#if REALM_APP_SERVICES
+        struct realm_sync_client_config config_struct {};
+        auto config = &config_struct;
+#else
+        auto config_ptr = cptr(realm_sync_client_config_new());
+        auto config = config_ptr.get();
+#endif // REALM_APP_SERVICES
+        realm_sync_client_config_set_default_binding_thread_observer(config, nullptr, nullptr, nullptr, nullptr,
                                                                      nullptr);
         auto no_handle_error_ptr =
             static_cast<CBindingThreadObserver*>(config->default_socket_provider_thread_observer.get());
@@ -6378,7 +6418,7 @@ TEST_CASE("C API app: link_user integration w/c_api transport", "[sync][app][c_a
     auto user_data = new TestTransportUserData();
     auto http_transport = realm_http_transport_new(send_request_to_server, user_data, user_data_free);
     auto app_session = get_runtime_app_session();
-    TestAppSession session(app_session, *http_transport, DeleteApp{false});
+    TestAppSession session(app_session, {*http_transport}, DeleteApp{false});
     realm_app app(session.app());
 
     SECTION("remove_user integration") {

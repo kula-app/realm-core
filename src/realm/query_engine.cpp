@@ -283,6 +283,7 @@ void StringNodeEqualBase::init(bool will_query_ranges)
     }
 
     if (uses_index) {
+        m_index_evaluator = std::make_optional(IndexEvaluator{});
         _search_index_init();
     }
 }
@@ -375,7 +376,8 @@ size_t IndexEvaluator::do_search_index(const Cluster* cluster, size_t start, siz
             return not_found;
 
         // Now actual_key must be found in leaf keys
-        return cluster->lower_bound_key(ObjKey(m_actual_key.value - cluster->get_offset()));
+        REALM_ASSERT(uint64_t(m_actual_key.value) >= cluster->get_offset());
+        return cluster->lower_bound_key(ClusterNode::RowKey(m_actual_key.value - cluster->get_offset()));
     }
     return not_found;
 }
@@ -392,8 +394,9 @@ StringNode<Equal>::StringNode(ColKey col, const Mixed* begin, const Mixed* end)
             m_needles.emplace();
         }
         else if (const StringData* str = it->get_if<StringData>()) {
-            m_needle_storage.push_back(std::make_unique<char[]>(str->size()));
+            m_needle_storage.push_back(std::make_unique<char[]>(str->size() + 1));
             std::copy(str->data(), str->data() + str->size(), m_needle_storage.back().get());
+            m_needle_storage.back()[str->size()] = '\0';
             m_needles.insert(StringData(m_needle_storage.back().get(), str->size()));
         }
     }
@@ -404,6 +407,10 @@ StringNode<Equal>::StringNode(ColKey col, const Mixed* begin, const Mixed* end)
 
 void StringNode<Equal>::_search_index_init()
 {
+    if (!m_needles.empty()) {
+        m_index_evaluator.reset();
+        return;
+    }
     REALM_ASSERT(bool(m_index_evaluator));
     auto index = ParentNode::m_table.unchecked_ptr()->get_search_index(ParentNode::m_condition_column_key);
     m_index_evaluator->init(index, StringNodeBase::m_string_value);

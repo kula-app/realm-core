@@ -114,7 +114,7 @@ std::optional<CollectionType> process_collection(const Property& property)
     else if (is_dictionary(property.type)) {
         return CollectionType::Dictionary;
     }
-    return {};
+    return std::nullopt;
 }
 
 ColKey add_column(Group& group, Table& table, Property const& property)
@@ -124,7 +124,8 @@ ColKey add_column(Group& group, Table& table, Property const& property)
     REALM_ASSERT(property.type != PropertyType::LinkingObjects);
 
     if (property.is_primary) {
-        // Primary key columns should have been created when the table was created
+        // Primary key columns should have been created when the table was created.
+        // Unless this is a migration
         if (auto col = table.get_column_key(property.name)) {
             return col;
         }
@@ -141,7 +142,7 @@ ColKey add_column(Group& group, Table& table, Property const& property)
             table.add_column(to_core_type(property.type), property.name, is_nullable(property.type), collection_type);
         if (property.requires_index())
             table.add_search_index(key);
-        if (property.requires_fulltext_index())
+        else if (property.requires_fulltext_index())
             table.add_fulltext_index(key);
         return key;
     }
@@ -830,7 +831,12 @@ static void apply_post_migration_changes(Group& group, std::vector<SchemaChange>
                                             handle_backlinks_automatically);
         }
         void operator()(RemoveTable) {}
-        void operator()(ChangePropertyType) {}
+        void operator()(ChangePropertyType op)
+        {
+            if (op.new_property->is_primary) {
+                set_primary_key(table(op.object), op.new_property);
+            }
+        }
         void operator()(MakePropertyNullable) {}
         void operator()(MakePropertyRequired) {}
         void operator()(AddProperty) {}
