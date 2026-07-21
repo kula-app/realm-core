@@ -160,6 +160,24 @@ char (&ArraySizeHelper(const T (&array)[N]))[N];
 // protected members, or virtual functions, and all of its member
 // variables must themselves be PODs.
 
+// Newer libc++ (Xcode 16.3+/iOS 27 SDK) marks std::is_pod with
+// _LIBCPP_NO_SPECIALIZATIONS, turning any user specialization into a hard
+// error. s2 only ever uses is_pod as an optimization hint that nothing in
+// this source tree actually queries, so when specialization is forbidden we
+// expand these macros to a no-op, keeping the trailing typedef so call sites
+// still require a terminating semicolon.
+#if defined(_LIBCPP_NO_SPECIALIZATIONS)
+
+#define DECLARE_POD(TypeName)                       \
+typedef int Dummy_Type_For_DECLARE_POD
+
+#define DECLARE_NESTED_POD(TypeName) DECLARE_POD(TypeName)
+
+#define PROPAGATE_POD_FROM_TEMPLATE_ARGUMENT(TemplateName)             \
+typedef int Dummy_Type_For_PROPAGATE_POD_FROM_TEMPLATE_ARGUMENT
+
+#else
+
 #define DECLARE_POD(TypeName)                       \
 namespace std {                                    \
 template<> struct is_pod<TypeName> : true_type { }; \
@@ -181,6 +199,8 @@ namespace std {                                                       \
 template <typename T> struct is_pod<TemplateName<T> > : std::is_trivial<T> { }; \
 }                                                                      \
 typedef int Dummy_Type_For_PROPAGATE_POD_FROM_TEMPLATE_ARGUMENT
+
+#endif  // defined(_LIBCPP_NO_SPECIALIZATIONS)
 
 // Macro that does nothing if TypeName is a POD, and gives a compiler
 // error if TypeName is a non-POD.  You should put a descriptive
